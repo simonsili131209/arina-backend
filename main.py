@@ -23,6 +23,11 @@ from video import engine as video_engine
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(db_engine)
+    with db_engine.begin() as conn:
+        try:
+            conn.exec_driver_sql("ALTER TABLE point_reports ADD COLUMN photo_data TEXT")
+        except Exception:
+            pass
     with SessionLocal() as db:
         seed_if_empty(db)
     yield
@@ -61,6 +66,7 @@ def report_out(r: PointReport) -> dict:
         "lng": r.lng,
         "density": r.density,
         "description": r.description,
+        "photo_data": r.photo_data,
         "status": r.status,
         "created_at": r.created_at.isoformat(),
         "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
@@ -189,12 +195,22 @@ class PointReportIn(BaseModel):
     lng: float
     density: str = "Sedang"
     description: Optional[str] = None
+    photo_data: Optional[str] = None
 
 
 class PointReportReviewIn(BaseModel):
     status: str  # "Valid" | "Ditolak"
     density: Optional[str] = None
     review_note: Optional[str] = None
+    # Data cadangan agar validasi tetap sukses meski kontainer serverless baru menyala
+    location_name: Optional[str] = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    description: Optional[str] = None
+    reporter_id: Optional[str] = None
+    reporter_name: Optional[str] = None
+    created_at: Optional[str] = None
+    photo_data: Optional[str] = None
 
 
 @app.get("/api/point-reports")
@@ -203,7 +219,6 @@ def list_point_reports(db: Session = Depends(get_db), user: dict = Depends(requi
     if user.get("role") == "admin":
         visible = rows
     else:
-        # Masyarakat/tamu hanya melihat titik yang sudah divalidasi petugas ATAU milik dirinya sendiri
         uid = str(user.get("sub"))
         visible = [r for r in rows if r.status == "Valid" or r.reporter_id == uid]
     return {"reports": [report_out(r) for r in visible]}
@@ -216,6 +231,8 @@ def create_point_report(body: PointReportIn, db: Session = Depends(get_db), user
         raise HTTPException(400, "Nama lokasi atau patokan sekitar sungai wajib diisi.")
     if not (-90 <= body.lat <= 90 and -180 <= body.lng <= 180):
         raise HTTPException(400, "Koordinat latitude/longitude tidak valid.")
+    if body.photo_data and len(body.photo_data) > 2_000_000:
+        raise HTTPException(400, "Ukuran foto terlalu besar. Silakan pilih foto lain.")
     dens = body.density if body.density in ("Tinggi", "Sedang", "Rendah") else "Sedang"
 
     rep = PointReport(
@@ -226,6 +243,7 @@ def create_point_report(body: PointReportIn, db: Session = Depends(get_db), user
         lng=round(body.lng, 6),
         density=dens,
         description=(body.description or "").strip() or None,
+        photo_data=body.photo_data or None,
         status="Menunggu Peninjauan",
         created_at=datetime.now(),
     )
@@ -238,11 +256,34 @@ def create_point_report(body: PointReportIn, db: Session = Depends(get_db), user
 @app.patch("/api/point-reports/{report_id}/review")
 def review_point_report(report_id: int, body: PointReportReviewIn, db: Session = Depends(get_db),
                         admin: dict = Depends(require_admin)):
-    rep = db.get(PointReport, report_id)
-    if not rep:
-        raise HTTPException(404, "Laporan titik koordinat tidak ditemukan.")
     if body.status not in ("Valid", "Ditolak"):
         raise HTTPException(400, "Keputusan peninjauan harus 'Valid' atau 'Ditolak'.")
+
+    rep = db.get(PointReport, report_id)
+    if not rep:
+        if body.location_name is not None and body.lat is not None and body.lng is not None:
+            try:
+                created_dt = datetime.fromisoformat(body.created_at) if body.created_at else datetime.now()
+            except Exception:
+                created_dt = datetime.now()
+            rep = PointReport(
+                id=report_id,
+                reporter_id=body.reporter_id or "warga",
+                reporter_name=body.reporter_name or "Warga",
+                location_name=body.location_name,
+                lat=round(body.lat, 6),
+                lng=round(body.lng, 6),
+                density=body.density if body.density in ("Tinggi", "Sedang", "Rendah") else "Sedang",
+                description=body.description,
+                photo_data=body.photo_data,
+                status="Menunggu Peninjauan",
+                created_at=created_dt,
+            )
+            db.add(rep)
+            db.flush()
+        else:
+            raise HTTPException(404, "Laporan titik koordinat tidak ditemukan.")
+
     if body.density in ("Tinggi", "Sedang", "Rendah"):
         rep.density = body.density
     rep.status = body.status
