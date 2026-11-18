@@ -1,6 +1,7 @@
 """ARINA API - FastAPI. Jalankan: uvicorn main:app --reload --port 8000"""
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+import os
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -11,10 +12,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 import config
-from auth import create_token, require_admin, require_user, verify_password
+from auth import create_token, hash_password, require_admin, require_user, verify_password
 from categories import CATEGORIES, CATEGORY_NAMES, PLASTIC_NAMES
 from database import Base, SessionLocal, engine as db_engine, get_db
-from models import Event, MonthlyStat, Point, PointCategoryStat, STATUS_FLOW, User
+from models import Event, MonthlyStat, Point, PointCategoryStat, PointReport, STATUS_FLOW, User
 from seed import seed_if_empty
 from video import engine as video_engine
 
@@ -50,6 +51,24 @@ def event_out(e: Event, p: Point) -> dict:
     }
 
 
+def report_out(r: PointReport) -> dict:
+    return {
+        "id": r.id,
+        "reporter_id": r.reporter_id,
+        "reporter_name": r.reporter_name,
+        "location_name": r.location_name,
+        "lat": r.lat,
+        "lng": r.lng,
+        "density": r.density,
+        "description": r.description,
+        "status": r.status,
+        "created_at": r.created_at.isoformat(),
+        "reviewed_at": r.reviewed_at.isoformat() if r.reviewed_at else None,
+        "reviewed_by": r.reviewed_by,
+        "review_note": r.review_note,
+    }
+
+
 def category_matrix(db: Session) -> dict:
     m = {p.code: {n: 0 for n in CATEGORY_NAMES} for p in db.query(Point).all()}
     for r in db.query(PointCategoryStat).all():
@@ -63,6 +82,17 @@ class LoginIn(BaseModel):
     password: str
 
 
+class RegisterIn(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class GoogleLoginIn(BaseModel):
+    email: str
+    name: Optional[str] = None
+
+
 @app.post("/api/auth/login")
 def login(body: LoginIn, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email.strip().lower()).first()
@@ -72,9 +102,52 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     return {"token": create_token(info), "user": info}
 
 
+@app.post("/api/auth/register")
+def register(body: RegisterIn, db: Session = Depends(get_db)):
+    clean_email = body.email.strip().lower()
+    clean_name = body.name.strip()
+    if not clean_name or not clean_email or len(body.password) < 6:
+        raise HTTPException(400, "Nama, email, dan sandi minimal 6 karakter wajib diisi.")
+    if db.query(User).filter(User.email == clean_email).first():
+        raise HTTPException(400, "Email sudah terdaftar. Silakan masuk melalui tab Login.")
+    user = User(
+        email=clean_email,
+        name=clean_name,
+        password_hash=hash_password(body.password),
+        role="user",
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    info = {"sub": str(user.id), "email": user.email, "name": user.name, "role": user.role}
+    return {"token": create_token(info), "user": info}
+
+
+@app.post("/api/auth/google")
+def login_google(body: GoogleLoginIn, db: Session = Depends(get_db)):
+    clean_email = body.email.strip().lower()
+    if not clean_email or "@" not in clean_email:
+        raise HTTPException(400, "Masukkan alamat email Google yang valid.")
+    user = db.query(User).filter(User.email == clean_email).first()
+    if not user:
+        display_name = (body.name or clean_email.split("@")[0]).strip()
+        user = User(
+            email=clean_email,
+            name=display_name,
+            password_hash=hash_password(os.urandom(16).hex()),
+            role="user",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    info = {"sub": str(user.id), "email": user.email, "name": user.name, "role": user.role}
+    return {"token": create_token(info), "user": info}
+
+
 @app.post("/api/auth/guest")
 def guest():
-    info = {"sub": "guest", "email": "", "name": "Tamu", "role": "guest"}
+    guest_id = f"guest_{os.urandom(4).hex()}"
+    info = {"sub": guest_id, "email": "", "name": "Tamu", "role": "guest"}
     return {"token": create_token(info), "user": info}
 
 
@@ -109,12 +182,84 @@ def points(db: Session = Depends(get_db), _: dict = Depends(require_user)):
     }
 
 
+# ----------------------------------------------------------------- penitikan koordinat masyarakat & validasi petugas
+class PointReportIn(BaseModel):
+    location_name: str
+    lat: float
+    lng: float
+    density: str = "Sedang"
+    description: Optional[str] = None
+
+
+class PointReportReviewIn(BaseModel):
+    status: str  # "Valid" | "Ditolak"
+    density: Optional[str] = None
+    review_note: Optional[str] = None
+
+
+@app.get("/api/point-reports")
+def list_point_reports(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    rows = db.query(PointReport).order_by(PointReport.created_at.desc()).all()
+    if user.get("role") == "admin":
+        visible = rows
+    else:
+        # Masyarakat/tamu hanya melihat titik yang sudah divalidasi petugas ATAU milik dirinya sendiri
+        uid = str(user.get("sub"))
+        visible = [r for r in rows if r.status == "Valid" or r.reporter_id == uid]
+    return {"reports": [report_out(r) for r in visible]}
+
+
+@app.post("/api/point-reports")
+def create_point_report(body: PointReportIn, db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    loc = body.location_name.strip()
+    if not loc:
+        raise HTTPException(400, "Nama lokasi atau patokan sekitar sungai wajib diisi.")
+    if not (-90 <= body.lat <= 90 and -180 <= body.lng <= 180):
+        raise HTTPException(400, "Koordinat latitude/longitude tidak valid.")
+    dens = body.density if body.density in ("Tinggi", "Sedang", "Rendah") else "Sedang"
+
+    rep = PointReport(
+        reporter_id=str(user.get("sub")),
+        reporter_name=user.get("name") or "Warga",
+        location_name=loc,
+        lat=round(body.lat, 6),
+        lng=round(body.lng, 6),
+        density=dens,
+        description=(body.description or "").strip() or None,
+        status="Menunggu Peninjauan",
+        created_at=datetime.now(),
+    )
+    db.add(rep)
+    db.commit()
+    db.refresh(rep)
+    return report_out(rep)
+
+
+@app.patch("/api/point-reports/{report_id}/review")
+def review_point_report(report_id: int, body: PointReportReviewIn, db: Session = Depends(get_db),
+                        admin: dict = Depends(require_admin)):
+    rep = db.get(PointReport, report_id)
+    if not rep:
+        raise HTTPException(404, "Laporan titik koordinat tidak ditemukan.")
+    if body.status not in ("Valid", "Ditolak"):
+        raise HTTPException(400, "Keputusan peninjauan harus 'Valid' atau 'Ditolak'.")
+    if body.density in ("Tinggi", "Sedang", "Rendah"):
+        rep.density = body.density
+    rep.status = body.status
+    rep.reviewed_at = datetime.now()
+    rep.reviewed_by = admin.get("name") or "Petugas ARINA"
+    rep.review_note = (body.review_note or "").strip() or None
+    db.commit()
+    db.refresh(rep)
+    return report_out(rep)
+
+
 @app.get("/api/categories")
 def categories(_: dict = Depends(require_user)):
     return {"categories": CATEGORIES}
 
 
-# ----------------------------------------------------------------- log kejadian (admin)
+# ----------------------------------------------------------------- log kejadian (khusus petugas)
 @app.get("/api/events")
 def list_events(point: str = "Semua", density: str = "Semua", category: str = "Semua",
                 status: str = "Semua", db: Session = Depends(get_db), _: dict = Depends(require_admin)):
@@ -210,7 +355,7 @@ def stats(point: str = "Semua", db: Session = Depends(get_db), _: dict = Depends
     }
 
 
-# ----------------------------------------------------------------- kamera (admin)
+# ----------------------------------------------------------------- kamera (khusus petugas)
 @app.get("/video_feed")
 def video_feed(_: dict = Depends(require_admin)):
     """MJPEG stream. Pakai: <img src="/video_feed?token=..."> (khusus petugas)."""
