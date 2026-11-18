@@ -21,10 +21,12 @@ TARGET_FPS = 20
 IDLE_TIMEOUT = 8          # detik; kamera dilepas bila tidak ada penonton
 
 # ---- Database & file ---------------------------------------------------------
-DATABASE_URL = f"sqlite:///{BASE_DIR / 'arina.db'}"
-STATIC_DIR = BASE_DIR / "static"
+IS_VERCEL = bool(os.getenv("VERCEL"))
+DATA_DIR = Path("/tmp") if IS_VERCEL else BASE_DIR
+DATABASE_URL = f"sqlite:///{DATA_DIR / 'arina.db'}"
+STATIC_DIR = DATA_DIR / "static"
 SNAPSHOT_DIR = STATIC_DIR / "snapshots"
-STATIC_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---- Keamanan ----------------------------------------------------------------
