@@ -1,4 +1,4 @@
-"""Seed data awal yang konsisten dengan mockup (Oktober 2026: 264 deteksi)."""
+"""Seed data awal dan 4 akun resmi petugas ARINA."""
 import random
 from datetime import datetime, timedelta
 
@@ -6,8 +6,15 @@ from sqlalchemy.orm import Session
 
 from auth import hash_password
 from categories import CATEGORIES, CATEGORY_NAMES
-from config import DEMO_ADMIN_EMAIL, DEMO_ADMIN_PASSWORD, SNAPSHOT_DIR
+from config import SNAPSHOT_DIR
 from models import Event, MonthlyStat, Point, PointCategoryStat, STATUS_FLOW, User
+
+OFFICIAL_STAFF = [
+    ("petugas1@arina.id", "Petugas 1 · Koordinator", "ArinaPetugas#01"),
+    ("petugas2@arina.id", "Petugas 2 · Lapangan", "ArinaPetugas#02"),
+    ("admin@arina.id", "Admin Utama ARINA", "ArinaAdmin#2026"),
+    ("lapangan@arina.id", "Petugas 4 · Pemantau", "ArinaLapangan#04"),
+]
 
 POINTS = [
     ("T1", "Titik 1", "Hulu",         -6.042250, 106.161917, "6°02'32.1\"S 106°09'42.9\"E", "Tinggi"),
@@ -16,18 +23,17 @@ POINTS = [
     ("T4", "Titik 4", "Tengah Hilir", -6.034528, 106.163306, "6°02'04.3\"S 106°09'47.9\"E", "Sedang"),
     ("T5", "Titik 5", "Muara",        -6.026944, 106.164139, "6°01'37.0\"S 106°09'50.9\"E", "Rendah"),
 ]
-PREV_TOTAL = {"T1": 30, "T2": 79, "T3": 64, "T4": 42, "T5": 31}   # total Sep = 246
+PREV_TOTAL = {"T1": 30, "T2": 79, "T3": 64, "T4": 42, "T5": 31}
 
-# urutan kolom = CATEGORY_NAMES; total kolom = 51,64,26,59,16,8,16,24 (=264)
 MATRIX = {
-    "T1": [5, 11, 3, 7, 2, 1, 1, 3],     # 33
-    "T2": [17, 22, 9, 21, 6, 3, 5, 7],   # 90
-    "T3": [14, 16, 7, 15, 4, 2, 4, 8],   # 70
-    "T4": [9, 10, 4, 9, 3, 1, 3, 3],     # 42
-    "T5": [6, 5, 3, 7, 1, 1, 3, 3],      # 29
+    "T1": [5, 11, 3, 7, 2, 1, 1, 3],
+    "T2": [17, 22, 9, 21, 6, 3, 5, 7],
+    "T3": [14, 16, 7, 15, 4, 2, 4, 8],
+    "T4": [9, 10, 4, 9, 3, 1, 3, 3],
+    "T5": [6, 5, 3, 7, 1, 1, 3, 3],
 }
 MONTHLY = [("Mei", 145, 53), ("Jun", 155, 59), ("Jul", 135, 52),
-           ("Agu", 168, 63), ("Sep", 182, 64), ("Okt", 200, 64)]  # total: 198,214,187,231,246,264
+           ("Agu", 168, 63), ("Sep", 182, 64), ("Okt", 200, 64)]
 
 
 def density_of(n: int) -> str:
@@ -65,11 +71,18 @@ def _snapshot(path, point_code, category, count, ts, color_hex, seed):
 
 
 def seed_if_empty(db: Session) -> None:
+    # Pastikan 4 akun resmi petugas selalu tersedia
+    for email, name, raw_pw in OFFICIAL_STAFF:
+        existing = db.query(User).filter(User.email == email).first()
+        if not existing:
+            db.add(User(email=email, name=name, password_hash=hash_password(raw_pw), role="admin"))
+        else:
+            existing.role = "admin"
+            existing.password_hash = hash_password(raw_pw)
+    db.commit()
+
     if db.query(Point).count() > 0:
         return
-
-    db.add(User(email=DEMO_ADMIN_EMAIL, name="Petugas ARINA",
-                password_hash=hash_password(DEMO_ADMIN_PASSWORD), role="admin"))
 
     for code, name, zone, lat, lng, dms, dens in POINTS:
         db.add(Point(code=code, name=name, zone=zone, lat=lat, lng=lng, dms=dms,
@@ -80,12 +93,11 @@ def seed_if_empty(db: Session) -> None:
     for i, (label, pl, non) in enumerate(MONTHLY):
         db.add(MonthlyStat(order=i, label=label, plastic=pl, non_plastic=non))
 
-    # --- 18 kejadian pekan ini (T1:3, T2:7, T3:5, T4:2, T5:1) ---
     rng = random.Random(2026)
     plan = ["T1"] * 3 + ["T2"] * 7 + ["T3"] * 5 + ["T4"] * 2 + ["T5"] * 1
     rng.shuffle(plan)
     now = datetime.now().replace(second=0, microsecond=0)
-    minutes_ago = sorted(rng.sample(range(25, 7 * 24 * 60), len(plan)))   # terbaru dulu
+    minutes_ago = sorted(rng.sample(range(25, 7 * 24 * 60), len(plan)))
     color = {c["name"]: c["color"] for c in CATEGORIES}
 
     for i, (code, ago) in enumerate(zip(plan, minutes_ago)):
