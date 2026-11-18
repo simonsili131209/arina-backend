@@ -38,6 +38,7 @@ class PointReport(Base):
     lng: Mapped[float] = mapped_column(Float)
     density: Mapped[str] = mapped_column(String(15), default="Sedang")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    photo_data: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(25), default="Menunggu Peninjauan")  # Menunggu Peninjauan | Valid | Ditolak
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
