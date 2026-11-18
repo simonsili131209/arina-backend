@@ -1,4 +1,6 @@
 """Mesin video: webcam/CCTV + deteksi YOLOv8 otomatis, blur privasi orang, & pencatatan ke Log Kejadian."""
+import os
+import random
 import random
 import threading
 import time
@@ -463,7 +465,9 @@ class VideoEngine:
 
     def mjpeg(self):
         last = None
-        while not self._stopped_by_user:
+        start = time.time()
+        max_sec = 8.0 if os.getenv("VERCEL") else float("inf")
+        while not self._stopped_by_user and (time.time() - start < max_sec):
             self.touch()
             with self._lock:
                 jpeg = self._jpeg
