@@ -12,7 +12,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(120), unique=True)
     name: Mapped[str] = mapped_column(String(80))
     password_hash: Mapped[str] = mapped_column(String(200))
-    role: Mapped[str] = mapped_column(String(20), default="admin")
+    role: Mapped[str] = mapped_column(String(20), default="user")
 
 
 class Point(Base):
@@ -25,6 +25,24 @@ class Point(Base):
     dms: Mapped[str] = mapped_column(String(60))
     density: Mapped[str] = mapped_column(String(10))                 # Tinggi/Sedang/Rendah
     prev_total: Mapped[int] = mapped_column(Integer, default=0)      # total September (untuk "vs Sep")
+
+
+class PointReport(Base):
+    """Penitikan koordinat baru oleh masyarakat & hasil validasi petugas."""
+    __tablename__ = "point_reports"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reporter_id: Mapped[str] = mapped_column(String(80))
+    reporter_name: Mapped[str] = mapped_column(String(80))
+    location_name: Mapped[str] = mapped_column(String(100))
+    lat: Mapped[float] = mapped_column(Float)
+    lng: Mapped[float] = mapped_column(Float)
+    density: Mapped[str] = mapped_column(String(15), default="Sedang")
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(25), default="Menunggu Peninjauan")  # Menunggu Peninjauan | Valid | Ditolak
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    review_note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class PointCategoryStat(Base):
