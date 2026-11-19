@@ -1,12 +1,21 @@
 """ARINA API - FastAPI. Jalankan: uvicorn main:app --reload --port 8000"""
+import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import smtplib
 import ssl
+import time
 from typing import Optional
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -107,6 +116,115 @@ def category_matrix(db: Session) -> dict:
     return m
 
 
+# ----------------------------------------------------------------- verifikasi email & token pendaftaran
+def _verify_secret() -> bytes:
+    sec = getattr(config, "SECRET_KEY", None) or os.getenv("SECRET_KEY") or "arina-email-verify-2026"
+    return sec.encode("utf-8")
+
+
+def sign_verification_payload(data: dict) -> str:
+    raw = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    b64 = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    sig = hmac.new(_verify_secret(), b64.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{b64}.{sig}"
+
+
+def read_verification_payload(token: str) -> dict:
+    try:
+        b64, sig = token.strip().split(".", 1)
+    except ValueError:
+        raise HTTPException(400, "Tautan atau token verifikasi tidak valid.")
+    expected = hmac.new(_verify_secret(), b64.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        raise HTTPException(400, "Tanda tangan token verifikasi tidak sah.")
+    pad = "=" * (-len(b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(b64 + pad).decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "Data verifikasi rusak.")
+    if int(payload.get("exp", 0)) < int(time.time()):
+        raise HTTPException(400, "Tautan & kode verifikasi sudah kedaluwarsa (lebih dari 15 menit). Silakan kirim ulang.")
+    return payload
+
+
+def send_arina_verification_email(to_email: str, nickname: str, full_name: str, otp_code: str, verify_link: str) -> bool:
+    smtp_user = (os.getenv("SMTP_USER") or "").strip()
+    smtp_pass = (os.getenv("SMTP_PASS") or "").strip().replace(" ", "")
+    smtp_host = (os.getenv("SMTP_HOST") or "smtp.gmail.com").strip()
+    smtp_port = int(os.getenv("SMTP_PORT") or "465")
+
+    if not smtp_user or not smtp_pass:
+        return False
+
+    spaced_otp = f"{otp_code[:3]} {otp_code[3:]}"
+    html_body = f"""
+    <!DOCTYPE html>
+    <html>
+    <body style="margin:0;padding:0;background-color:#050816;font-family:'Segoe UI',Roboto,Arial,sans-serif;color:#e2e8f0;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#050816;padding:32px 16px;">
+        <tr>
+          <td align="center">
+            <table width="100%" style="max-width:520px;background:linear-gradient(180deg,#0b132b 0%,#0f172a 100%);border:1px solid #1e3a5f;border-radius:20px;overflow:hidden;">
+              <tr>
+                <td style="padding:28px 32px 16px;text-align:center;border-bottom:1px solid rgba(56,189,248,0.18);">
+                  <div style="display:inline-block;padding:6px 14px;border-radius:999px;background:rgba(42,160,255,0.15);border:1px solid rgba(56,189,248,0.35);color:#7dd3fc;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;">
+                    ARINA · Pemantauan Sungai
+                  </div>
+                  <h1 style="margin:14px 0 4px;font-size:24px;color:#ffffff;">Verifikasi Akun Baru</h1>
+                  <p style="margin:0;font-size:13px;color:#94a3b8;">Sungai Karangantu · Sistem Pemantauan Lingkungan</p>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:28px 32px;">
+                  <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#f1f5f9;">
+                    Halo <strong style="color:#38bdf8;">{nickname}</strong> ({full_name}),
+                  </p>
+                  <p style="margin:0 0 22px;font-size:14px;line-height:1.65;color:#cbd5e1;">
+                    Terima kasih sudah mendaftar di <strong>ARINA</strong>. Klik tombol di bawah ini untuk memverifikasi email dan langsung masuk ke platform pemantauan sungai:
+                  </p>
+
+                  <div style="text-align:center;margin:26px 0;">
+                    <a href="{verify_link}" style="display:inline-block;padding:14px 28px;background:linear-gradient(135deg,#2AA0FF 0%,#4f46e5 100%);color:#ffffff;text-decoration:none;font-weight:700;font-size:14px;border-radius:12px;box-shadow:0 8px 20px rgba(42,160,255,0.35);">
+                      Verifikasi &amp; Masuk ke ARINA
+                    </a>
+                  </div>
+
+                  <div style="margin:24px 0;padding:18px;background:rgba(15,23,42,0.85);border:1px dashed rgba(56,189,248,0.4);border-radius:14px;text-align:center;">
+                    <div style="font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:6px;">
+                      Atau masukkan kode verifikasi 6 digit
+                    </div>
+                    <div style="font-size:28px;font-weight:800;letter-spacing:6px;color:#38bdf8;font-family:monospace;">
+                      {spaced_otp}
+                    </div>
+                  </div>
+
+                  <p style="margin:0;font-size:12px;line-height:1.6;color:#64748b;">
+                    Tautan dan kode ini berlaku selama <strong>15 menit</strong>. Jika kamu tidak merasa membuat akun ARINA, abaikan email ini.
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+    """
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"[{otp_code}] Verifikasi Akun ARINA Pemantauan Sungai"
+    msg["From"] = f"ARINA Pemantauan Sungai <{smtp_user}>"
+    msg["To"] = to_email
+    msg.attach(MIMEText(f"Halo {nickname}, klik link ini untuk verifikasi akun ARINA: {verify_link} atau masukkan kode: {otp_code}", "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=12, context=ctx) as server:
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(smtp_user, [to_email], msg.as_string())
+    return True
+
+
 # ----------------------------------------------------------------- auth
 class LoginIn(BaseModel):
     email: str
@@ -118,6 +236,12 @@ class RegisterIn(BaseModel):
     email: str
     password: str
     nickname: Optional[str] = None
+    frontend_url: Optional[str] = None
+
+
+class VerifyRegisterIn(BaseModel):
+    verify_token: str
+    otp_code: Optional[str] = None
 
 
 class GoogleLoginIn(BaseModel):
@@ -138,6 +262,85 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
         "role": user.role,
     }
     return {"token": create_token(info), "user": info}
+
+
+@app.post("/api/auth/register-request")
+def register_request(body: RegisterIn, db: Session = Depends(get_db)):
+    clean_email = body.email.strip().lower()
+    clean_name = body.name.strip()
+    clean_nick = (body.nickname or "").strip() or default_nickname(clean_email, clean_name)
+
+    if not clean_name or not clean_email or "@" not in clean_email or len(body.password) < 6:
+        raise HTTPException(400, "Nama panggilan, nama lengkap, email valid, dan sandi minimal 6 karakter wajib diisi.")
+    if db.query(User).filter(User.email == clean_email).first():
+        raise HTTPException(400, "Email sudah terdaftar. Silakan masuk melalui tab Masuk Akun.")
+
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+    payload = {
+        "email": clean_email,
+        "name": clean_name,
+        "nickname": clean_nick,
+        "password_hash": hash_password(body.password),
+        "otp": otp_code,
+        "exp": int(time.time()) + 900,  # 15 menit
+    }
+    v_token = sign_verification_payload(payload)
+
+    base_front = (
+        (body.frontend_url or "").strip().rstrip("/")
+        or (os.getenv("FRONTEND_URL") or "").strip().rstrip("/")
+        or "https://arina-monitoring.vercel.app"
+    )
+    verify_link = f"{base_front}/?verify_token={urllib.parse.quote(v_token)}"
+
+    try:
+        sent = send_arina_verification_email(clean_email, clean_nick, clean_name, otp_code, verify_link)
+    except Exception as ex:
+        raise HTTPException(500, f"Gagal mengirim email verifikasi: {type(ex).__name__}. Periksa konfigurasi SMTP.")
+
+    return {
+        "status": "verification_sent",
+        "email": clean_email,
+        "nickname": clean_nick,
+        "verify_token": v_token,
+        "email_dispatched": sent,
+        "dev_hint": None if sent else {"otp_code": otp_code, "verify_link": verify_link},
+    }
+
+
+@app.post("/api/auth/verify-registration")
+def verify_registration(body: VerifyRegisterIn, db: Session = Depends(get_db)):
+    payload = read_verification_payload(body.verify_token)
+
+    if body.otp_code is not None:
+        cleaned_otp = re.sub(r"\s+", "", body.otp_code.strip())
+        if cleaned_otp != payload.get("otp"):
+            raise HTTPException(400, "Kode verifikasi 6 digit tidak cocok. Periksa kembali email kamu.")
+
+    clean_email = payload["email"]
+    clean_name = payload["name"]
+    clean_nick = payload.get("nickname") or default_nickname(clean_email, clean_name)
+
+    user = db.query(User).filter(User.email == clean_email).first()
+    if not user:
+        user = User(
+            email=clean_email,
+            name=clean_name,
+            password_hash=payload["password_hash"],
+            role="user",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    info = {
+        "sub": str(user.id),
+        "email": user.email,
+        "name": user.name,
+        "nickname": clean_nick,
+        "role": user.role,
+    }
+    return {"token": create_token(info), "user": info, "nickname": clean_nick}
 
 
 @app.post("/api/auth/register")
@@ -421,7 +624,6 @@ def get_gemini_key() -> str:
 
 
 def discover_available_models(api_key: str, ctx: ssl.SSLContext) -> list[str]:
-    """Ambil daftar model Gemini aktif langsung dari endpoint API Google agar bebas HTTP 404."""
     found: list[str] = []
     for ver in ("v1beta", "v1"):
         try:
