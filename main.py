@@ -1,8 +1,11 @@
 """ARINA API - FastAPI. Jalankan: uvicorn main:app --reload --port 8000"""
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+import json
 import os
+import re
 from typing import Optional
+import urllib.request
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -353,6 +356,253 @@ def update_status(event_id: int, body: StatusIn, db: Session = Depends(get_db),
     e.status = body.status
     db.commit()
     return event_out(e, db.get(Point, e.point_code))
+
+
+# ----------------------------------------------------------------- asisten AI ARINA & notifikasi peringatan
+class AiChatIn(BaseModel):
+    message: str
+
+
+SENSITIVE_PATTERN = re.compile(
+    r"\b(email|e-mail|sandi|password|pass|kata\s*sandi|login|masuk\s*akun|username|user\s*id|token|jwt|secret|kredensial|hack|bobol|nomor\s*hp|telepon|whatsapp|wa\s*petugas|alamat\s*rumah)\b",
+    re.IGNORECASE,
+)
+
+DOMAIN_PATTERN = re.compile(
+    r"\b(sampah|sungai|arina|titik|t1|t2|t3|t4|t5|karangantu|hulu|hilir|plastik|botol|kemasan|kertas|kardus|organik|kain|logam|kaca|styrofoam|tumpuk|penumpukan|kepadatan|tinggi|sedang|rendah|kejadian|laporan|peta|deteksi|kamera|yolo|kategori|statistik|lapor|bersih|banjir|limbah|daur\s*ulang|halo|hai|pagi|siang|sore|malam|terima\s*kasih|makasih|apa\s*itu|siapa\s*kamu|bantu|info|terbaru|kondisi|status)\b",
+    re.IGNORECASE,
+)
+
+
+def build_river_snapshot(db: Session) -> dict:
+    pts = db.query(Point).order_by(Point.code).all()
+    matrix = category_matrix(db)
+    point_summaries = []
+    for p in pts:
+        cats = sorted(matrix[p.code].items(), key=lambda kv: kv[1], reverse=True)
+        top_cats = [f"{c} ({n})" for c, n in cats[:3] if n > 0]
+        point_summaries.append({
+            "code": p.code,
+            "name": p.name,
+            "zone": p.zone,
+            "density": p.density,
+            "total": sum(matrix[p.code].values()),
+            "top_cats": top_cats,
+        })
+
+    pts_map = {p.code: p for p in pts}
+    latest_events = db.query(Event).order_by(Event.occurred_at.desc()).limit(6).all()
+    event_list = []
+    for e in latest_events:
+        p = pts_map.get(e.point_code)
+        event_list.append({
+            "point_code": e.point_code,
+            "zone": p.zone if p else e.point_code,
+            "category": e.category,
+            "count": e.count,
+            "density": e.density,
+            "status": e.status,
+            "time": e.occurred_at.strftime("%d %b %Y %H:%M"),
+        })
+
+    valid_reports = (
+        db.query(PointReport)
+        .filter(PointReport.status == "Valid")
+        .order_by(PointReport.reviewed_at.desc())
+        .limit(4)
+        .all()
+    )
+    report_list = [
+        {
+            "location": r.location_name,
+            "density": r.density,
+            "description": r.description or "",
+            "time": (r.reviewed_at or r.created_at).strftime("%d %b %Y %H:%M"),
+        }
+        for r in valid_reports
+    ]
+    return {
+        "points": point_summaries,
+        "events": event_list,
+        "reports": report_list,
+        "pending_events": db.query(Event).filter(Event.status == STATUS_FLOW[0]).count(),
+    }
+
+
+def local_arina_reply(msg: str, snap: dict) -> str:
+    q = msg.strip().lower()
+
+    # Sapaan & perkenalan
+    if re.fullmatch(r"(halo|hai|hi|hello|assalamualaikum|selamat\s*(pagi|siang|sore|malam)|p|tes|test)[!.? ]*", q):
+        return (
+            "Halo! Saya **ARINA**, asisten cerdas pemantauan sampah Sungai Karangantu. "
+            "Kamu bisa menanyakan kondisi penumpukan sampah terbaru di titik T1–T5, rincian jenis sampah yang terdeteksi, "
+            "atau cara melaporkan titik tumpukan sampah baru."
+        )
+
+    if any(k in q for k in ("siapa kamu", "apa itu arina", "fungsi kamu", "bisa apa")):
+        return (
+            "Saya **ARINA** (Asisten Pemantauan Sungai). Tugas saya membantu pengunjung dan petugas mendapatkan "
+            "informasi terbaru mengenai jenis-jenis sampah yang terdeteksi, titik rawan penumpukan di sepanjang sungai, "
+            "serta panduan pelaporan lokasi sampah."
+        )
+
+    # Cek jika menanyakan titik spesifik T1 - T5
+    code_match = re.search(r"\bt([1-5])\b", q)
+    if code_match:
+        target_code = f"T{code_match.group(1)}"
+        pt = next((p for p in snap["points"] if p["code"] == target_code), None)
+        if pt:
+            dom = ", ".join(pt["top_cats"]) if pt["top_cats"] else "belum ada dominasi kategori"
+            rel_ev = [e for e in snap["events"] if e["point_code"] == target_code]
+            ev_txt = (
+                f" Kejadian terbaru di {target_code}: **{rel_ev[0]['category']}** ({rel_ev[0]['count']} objek, status *{rel_ev[0]['status']}*) pada {rel_ev[0]['time']}."
+                if rel_ev else ""
+            )
+            return (
+                f"Kondisi **{pt['code']} ({pt['name']} · {pt['zone']})** saat ini berstatus kepadatan **{pt['density']}** "
+                f"dengan total **{pt['total']} objek** sampah tercatat. Jenis terbanyak: {dom}.{ev_txt}"
+            )
+
+    # Cek pertanyaan tentang jenis / kategori sampah
+    if any(k in q for k in ("jenis sampah", "kategori sampah", "macam sampah", "plastik", "botol", "kemasan", "kertas", "kardus", "organik", "styrofoam", "logam", "kaca")):
+        cat_lines = []
+        for c in CATEGORIES[:8]:
+            cname = c.get("name") or c.get("category") or str(c)
+            cdesc = c.get("description") or c.get("desc") or ""
+            cat_lines.append(f"• **{cname}**" + (f": {cdesc}" if cdesc else ""))
+        return (
+            "Sistem ARINA memantau beberapa kategori sampah utama di alur sungai:\n"
+            + "\n".join(cat_lines)
+            + "\n\nSampah plastik (seperti botol, kantong plastik, dan kemasan makanan) mendominasi temuan karena sulit terurai dan mudah terbawa arus dari hulu ke hilir."
+        )
+
+    # Cek pertanyaan tentang cara melapor / menggunakan peta
+    if any(k in q for k in ("cara lapor", "melaporkan", "titik baru", "penitikan", "street view")):
+        return (
+            "Untuk melaporkan tumpukan sampah baru:\n"
+            "1. Buka halaman **Peta Titik Rawan**.\n"
+            "2. Gulir ke panel **Penitikan Koordinat Baru** di bawah peta (atau klik ikon **Layer → Titik Baru**).\n"
+            "3. Tekan **Lokasi Saya (GPS)** atau ketuk langsung posisi di peta, unggah foto lokasi, lalu kirim agar segera diverifikasi petugas."
+        )
+
+    # Default: ringkasan kondisi terbaru & titik paling menumpuk
+    pts_sorted = sorted(snap["points"], key=lambda x: x["total"], reverse=True)
+    high_pts = [p for p in snap["points"] if p["density"] == "Tinggi"]
+    top_pt = pts_sorted[0] if pts_sorted else None
+
+    lines = []
+    if high_pts:
+        high_str = ", ".join(f"**{p['code']} ({p['zone']}, {p['total']} objek)**" for p in high_pts)
+        lines.append(f"⚠️ **Titik Kepadatan Tinggi Saat Ini:** {high_str}.")
+    elif top_pt:
+        lines.append(f"📍 **Titik Terpadat Saat Ini:** **{top_pt['code']} ({top_pt['zone']})** dengan **{top_pt['total']} objek** (kepadatan {top_pt['density']}).")
+
+    if snap["events"]:
+        ev = snap["events"][0]
+        lines.append(
+            f"🕒 **Temuan Terbaru di Log:** **{ev['category']}** ({ev['count']} objek, kepadatan {ev['density']}) "
+            f"terdeteksi di **{ev['point_code']} ({ev['zone']})** pada {ev['time']} — status *{ev['status']}*."
+        )
+
+    if snap["reports"]:
+        rp = snap["reports"][0]
+        lines.append(f"📌 **Laporan Warga Tervalidasi:** {rp['location']} (kepadatan {rp['density']}, {rp['time']}).")
+
+    lines.append(f"Saat ini terdapat **{snap['pending_events']} kejadian** yang masih menunggu penanganan petugas.")
+    return "\n\n".join(lines)
+
+
+@app.post("/api/ai/chat")
+def ai_chat(body: AiChatIn, db: Session = Depends(get_db), _: dict = Depends(require_user)):
+    msg = (body.message or "").strip()
+    if not msg:
+        raise HTTPException(400, "Pertanyaan tidak boleh kosong.")
+    if len(msg) > 600:
+        raise HTTPException(400, "Pertanyaan terlalu panjang (maksimal 600 karakter).")
+
+    # Lapis 1: Tolak keras pertanyaan seputar kredensial, email, sandi, atau data akun
+    if SENSITIVE_PATTERN.search(msg):
+        return {
+            "reply": "Maaf, saya tidak tahu dan tidak memiliki akses terhadap email, kata sandi, maupun data akun petugas atau pengguna. Saya hanya dapat menjawab pertanyaan seputar jenis sampah dan kondisi pemantauan sungai ARINA.",
+            "guardrailed": True,
+        }
+
+    # Lapis 2: Batasi hanya pada topik sampah, sungai, dan sistem ARINA
+    if not DOMAIN_PATTERN.search(msg):
+        return {
+            "reply": "Maaf, saya hanya dirancang untuk menjawab pertanyaan seputar pemantauan sampah sungai ARINA, jenis-jenis sampah, serta informasi penumpukan sampah di titik pemantauan (T1–T5).",
+            "guardrailed": True,
+        }
+
+    snap = build_river_snapshot(db)
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    if api_key:
+        try:
+            sys_prompt = (
+                "Kamu adalah ARINA, asisten AI resmi untuk website pemantauan sampah Sungai Karangantu. "
+                "ATURAN WAJIB: "
+                "1. Jawab HANYA pertanyaan tentang jenis sampah, pengelolaan sampah sungai, dan data pemantauan ARINA berikut. "
+                "2. JANGAN PERNAH memberikan atau mengarang email, kata sandi, nomor telepon, atau data akun petugas/pengguna; jika ditanya jawab 'Maaf, saya tidak tahu.' "
+                "3. Jawab ringkas, ramah, dalam Bahasa Indonesia yang jelas berdasarkan data terkini ini:\n"
+                f"{json.dumps(snap, ensure_ascii=False)}"
+            )
+            payload = {
+                "contents": [{"parts": [{"text": f"{sys_prompt}\n\nPertanyaan pengguna: {msg}"}]}],
+                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 450},
+            }
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+                text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if text:
+                    return {"reply": text, "guardrailed": False}
+        except Exception:
+            pass
+
+    return {"reply": local_arina_reply(msg, snap), "guardrailed": False}
+
+
+@app.get("/api/alerts/latest")
+def latest_alerts(db: Session = Depends(get_db), _: dict = Depends(require_user)):
+    pts = {p.code: p for p in db.query(Point).all()}
+    alerts = []
+
+    for e in db.query(Event).order_by(Event.occurred_at.desc()).limit(5).all():
+        p = pts.get(e.point_code)
+        zone = p.zone if p else e.point_code
+        alerts.append({
+            "id": f"ev-{e.id}",
+            "title": f"Deteksi Sampah Baru · {e.point_code} ({zone})",
+            "body": f"Terdeteksi {e.category} ({e.count} objek) · Kepadatan {e.density}.",
+            "density": e.density,
+            "at": e.occurred_at.isoformat(),
+        })
+
+    for r in (
+        db.query(PointReport)
+        .filter(PointReport.status == "Valid")
+        .order_by(PointReport.reviewed_at.desc())
+        .limit(3)
+        .all()
+    ):
+        dt = r.reviewed_at or r.created_at
+        alerts.append({
+            "id": f"rep-{r.id}",
+            "title": f"Titik Sampah Tervalidasi · {r.location_name}",
+            "body": f"Kepadatan {r.density}. {r.description or 'Lokasi telah diverifikasi petugas ARINA.'}",
+            "density": r.density,
+            "at": dt.isoformat(),
+        })
+
+    alerts.sort(key=lambda x: x["at"], reverse=True)
+    return {"alerts": alerts[:6]}
 
 
 # ----------------------------------------------------------------- statistik
