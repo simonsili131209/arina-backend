@@ -358,7 +358,7 @@ def update_status(event_id: int, body: StatusIn, db: Session = Depends(get_db),
     return event_out(e, db.get(Point, e.point_code))
 
 
-# ----------------------------------------------------------------- asisten AI ARINA & notifikasi peringatan
+# ----------------------------------------------------------------- asisten AI ARINA (Fundamental Sampah, Riset Peneliti, & Pemantauan Sungai)
 class AiChatIn(BaseModel):
     message: str
 
@@ -369,7 +369,7 @@ SENSITIVE_PATTERN = re.compile(
 )
 
 DOMAIN_PATTERN = re.compile(
-    r"\b(sampah|sungai|arina|titik|t1|t2|t3|t4|t5|karangantu|hulu|hilir|plastik|botol|kemasan|kertas|kardus|organik|kain|logam|kaca|styrofoam|tumpuk|penumpukan|kepadatan|tinggi|sedang|rendah|kejadian|laporan|peta|deteksi|kamera|yolo|kategori|statistik|lapor|bersih|banjir|limbah|daur\s*ulang|halo|hai|pagi|siang|sore|malam|terima\s*kasih|makasih|apa\s*itu|siapa\s*kamu|bantu|info|terbaru|kondisi|status)\b",
+    r"\b(sampah|limbah|sungai|arina|titik|t1|t2|t3|t4|t5|karangantu|hulu|hilir|plastik|botol|kemasan|kertas|kardus|organik|anorganik|b3|kain|logam|kaca|styrofoam|mikroplastik|polimer|pet|hdpe|ldpe|pp|tumpuk|penumpukan|kepadatan|tinggi|sedang|rendah|kejadian|laporan|peta|deteksi|kamera|yolo|kategori|statistik|lapor|bersih|banjir|daur\s*ulang|3r|terurai|urai|degradasi|lama|tahun|artikel|jurnal|peneliti|penelitian|riset|studi|data|sumber|referensi|pdf|bukti|ilmiah|ekosistem|pencemaran|polusi|lingkungan|dampak|bahaya|akibat|fundamental|pengertian|jenis|halo|hai|hi|pagi|siang|sore|malam|terima\s*kasih|makasih|apa\s*itu|siapa\s*kamu|bantu|info|terbaru|kondisi|status|kenapa|mengapa|bagaimana)\b",
     re.IGNORECASE,
 )
 
@@ -391,40 +391,22 @@ def build_river_snapshot(db: Session) -> dict:
         })
 
     pts_map = {p.code: p for p in pts}
-    latest_events = db.query(Event).order_by(Event.occurred_at.desc()).limit(6).all()
-    event_list = []
-    for e in latest_events:
-        p = pts_map.get(e.point_code)
-        event_list.append({
+    latest_events = db.query(Event).order_by(Event.occurred_at.desc()).limit(5).all()
+    event_list = [
+        {
             "point_code": e.point_code,
-            "zone": p.zone if p else e.point_code,
+            "zone": pts_map[e.point_code].zone if e.point_code in pts_map else e.point_code,
             "category": e.category,
             "count": e.count,
             "density": e.density,
             "status": e.status,
             "time": e.occurred_at.strftime("%d %b %Y %H:%M"),
-        })
-
-    valid_reports = (
-        db.query(PointReport)
-        .filter(PointReport.status == "Valid")
-        .order_by(PointReport.reviewed_at.desc())
-        .limit(4)
-        .all()
-    )
-    report_list = [
-        {
-            "location": r.location_name,
-            "density": r.density,
-            "description": r.description or "",
-            "time": (r.reviewed_at or r.created_at).strftime("%d %b %Y %H:%M"),
         }
-        for r in valid_reports
+        for e in latest_events
     ]
     return {
         "points": point_summaries,
         "events": event_list,
-        "reports": report_list,
         "pending_events": db.query(Event).filter(Event.status == STATUS_FLOW[0]).count(),
     }
 
@@ -432,85 +414,96 @@ def build_river_snapshot(db: Session) -> dict:
 def local_arina_reply(msg: str, snap: dict) -> str:
     q = msg.strip().lower()
 
-    # Sapaan & perkenalan
+    # 1. Sapaan hangat & alami
     if re.fullmatch(r"(halo|hai|hi|hello|assalamualaikum|selamat\s*(pagi|siang|sore|malam)|p|tes|test)[!.? ]*", q):
         return (
-            "Halo! Saya **ARINA**, asisten cerdas pemantauan sampah Sungai Karangantu. "
-            "Kamu bisa menanyakan kondisi penumpukan sampah terbaru di titik T1–T5, rincian jenis sampah yang terdeteksi, "
-            "atau cara melaporkan titik tumpukan sampah baru."
+            "Halo! Senang bisa ngobrol denganmu. Saya **ARINA**, teman diskusimu seputar ilmu lingkungan, "
+            "karakteristik sampah & limbah, dampak penumpukannya di sungai, hingga referensi riset ilmiah di balik data yang kami tampilkan. "
+            "Ada topik atau data penelitian yang sedang bikin kamu penasaran?"
         )
 
     if any(k in q for k in ("siapa kamu", "apa itu arina", "fungsi kamu", "bisa apa")):
         return (
-            "Saya **ARINA** (Asisten Pemantauan Sungai). Tugas saya membantu pengunjung dan petugas mendapatkan "
-            "informasi terbaru mengenai jenis-jenis sampah yang terdeteksi, titik rawan penumpukan di sepanjang sungai, "
-            "serta panduan pelaporan lokasi sampah."
+            "Saya **ARINA** — asisten cerdas yang dirancang khusus mendampingi sistem pemantauan Sungai Karangantu. "
+            "Kamu bisa mengajak saya berdiskusi tentang konsep fundamental sampah dan limbah, dampak ekologis penumpukan di aliran sungai, "
+            "kondisi titik pemantauan terkini, maupun menelusuri **jurnal dan artikel PDF para peneliti** yang menjadi rujukan data waktu urai sampah."
         )
 
-    # Cek jika menanyakan titik spesifik T1 - T5
+    # 2. Pertanyaan sumber data ilmiah, lama penguraian plastik, artikel & PDF peneliti
+    if any(k in q for k in ("artikel", "jurnal", "peneliti", "penelitian", "riset", "studi", "dari mana", "sumber data", "pdf", "referensi", "bukti", "terurai", "berapa lama", "450", "tahun", "degradasi")):
+        return (
+            "Estimasi bahwa **botol plastik (PET) membutuhkan sekitar 450 tahun** dan kantong plastik (HDPE/LDPE) puluhan hingga ratusan tahun untuk terurai bukan sekadar perkiraan kasar, melainkan hasil pengukuran laju degradasi polimer (*Specific Surface Degradation Rate* / SSDR) di lingkungan perairan dan sedimen.\n\n"
+            "**Mengapa botol plastik begitu sulit terurai di sungai?**\n"
+            "• Rantai polimer *Polyethylene Terephthalate* (PET) memiliki ikatan ester aromatik yang sangat stabil dan kristalinitas tinggi sehingga enzim mikroba alami hampir tidak mampu memutusnya.\n"
+            "• Saat botol tenggelam atau tertutup lumpur sungai, paparan sinar UV matahari dan oksigen terlarut menurun drastis, sehingga proses fotodegradasi melambat hingga puluhan kali lipat dibanding di daratan terbuka.\n\n"
+            "**Referensi Artikel & PDF Para Peneliti:**\n"
+            "1. **Chamas, A. et al. (2020)** — *Degradation Rates of Plastics in the Environment* (ACS Sustainable Chemistry & Engineering). Mengukur langsung laju peluruhan massa polimer PET, HDPE, LDPE, dan PP di lingkungan tanah maupun laut.\n"
+            "   • [Baca Jurnal (DOI)](https://doi.org/10.1021/acssuschemeng.9b06635) | [Unduh PDF Peneliti](https://pubs.acs.org/doi/pdf/10.1021/acssuschemeng.9b06635)\n"
+            "2. **Jambeck, J. R. et al. (2015)** — *Plastic waste inputs from land into the ocean* (Science). Studi rujukan global mengenai aliran sampah plastik dari wilayah pesisir dan daerah aliran sungai.\n"
+            "   • [Baca Jurnal (Science)](https://doi.org/10.1126/science.1260352) | [Unduh PDF](https://www.science.org/doi/pdf/10.1126/science.1260352)\n"
+            "3. **Lebreton, L. et al. (2017)** — *River plastic emissions to the world's oceans* (Nature Communications). Memodelkan transportasi sampah plastik dari hulu sungai menuju muara dan laut.\n"
+            "   • [Baca & Unduh PDF Open-Access](https://www.nature.com/articles/ncomms15611.pdf)\n"
+            "4. **UNEP (2021)** — *From Pollution to Solution: A Global Assessment of Marine Litter and Plastic Pollution*. Laporan komprehensif PBB mengenai dampak dan siklus degradasi sampah perairan.\n"
+            "   • [Unduh Laporan PDF Resmi](https://wedocs.unep.org/bitstream/handle/20.500.11822/36963/POLSOL.pdf)"
+        )
+
+    # 3. Konsep fundamental sampah vs limbah & klasifikasi dasar
+    if any(k in q for k in ("fundamental", "perbedaan sampah dan limbah", "apa itu limbah", "apa itu sampah", "pengertian", "organik", "anorganik", "b3", "mikroplastik")):
+        return (
+            "Secara fundamental dalam ilmu lingkungan, **sampah** dan **limbah** memiliki cakupan yang saling berkaitan namun berbeda fokus:\n\n"
+            "• **Sampah (*Solid Waste*):** Sisa aktivitas harian manusia atau proses alam yang berbentuk padat (seperti botol PET, kemasan berlapis aluminium foil, sisa makanan, kayu, dan tekstil).\n"
+            "• **Limbah (*Waste / Effluent*):** Buangan hasil proses produksi, industri, maupun domestik yang dapat berwujud cair, gas, maupun padat — sering kali membawa beban pencemar kimia atau biologis langsung ke badan air.\n\n"
+            "**Pembagian Fundamental Sampah di Ekosistem Sungai:**\n"
+            "1. **Organik (*Biodegradable*):** Mudah diurai mikroorganisme (sisa makanan, ranting, daun), tetapi jika menumpuk berlebihan akan memicu pembusukan anaerob dan menguras oksigen terlarut (*Dissolved Oxygen*).\n"
+            "2. **Anorganik Persisten:** Sulit terurai secara biologis (plastik sekali pakai, styrofoam, kaca, logam). Di sungai, plastik tidak benar-benar hilang, melainkan terfragmentasi secara mekanis menjadi **mikroplastik (< 5 mm)**.\n"
+            "3. **Bahan Berbahaya & Beracun (B3):** Baterai bekas, kemasan pestisida, atau oli yang melepaskan logam berat dan senyawa toksik ke rantai makanan perairan.\n\n"
+            "Referensi riset produksi & nasib seluruh polimer plastik global:\n"
+            "• **Geyer, R., Jambeck, J. R., & Law, K. L. (2017)** — *Production, use, and fate of all plastics ever made* ([Unduh PDF Science Advances](https://www.science.org/doi/pdf/10.1126/sciadv.1700782))"
+        )
+
+    # 4. Dampak penumpukan sampah di sungai
+    if any(k in q for k in ("dampak", "akibat", "bahaya", "banjir", "ekosistem", "ikan", "pencemaran", "polusi", "kesehatan")):
+        return (
+            "Penumpukan sampah di badan sungai menimbulkan dampak berantai pada tiga aspek utama:\n\n"
+            "1. **Hidrologis (Penyempitan Penampang Sungai):** Sumbatan sampah plastik dan ranting di pilar jembatan atau tikungan sungai menghambat debit aliran saat hujan deras, memicu luapan banjir lokal.\n"
+            "2. **Ekologis & Kualitas Air:** Timbunan sampah menghalangi penetrasi cahaya matahari ke dasar perairan, menurunkan kadar oksigen terlarut (hipoksia), serta melepaskan zat aditif plastik (*phthalates*, *bisphenol-A*) yang mengganggu biota air dan ikan konsumsi.\n"
+            "3. **Bioakumulasi Mikroplastik:** Fragmentasi sampah plastik membentuk partikel mikroplastik yang tertelan oleh plankton dan ikan muara, lalu berpindah kembali ke tubuh manusia melalui rantai pangan.\n\n"
+            "Rujukan ilmiah fragmentasi & akumulasi sampah perairan:\n"
+            "• **Barnes, D. K. A. et al. (2009)** — *Accumulation and fragmentation of plastic debris in global environments* ([Unduh PDF Royal Society](https://royalsocietypublishing.org/doi/pdf/10.1098/rstb.2008.0205))"
+        )
+
+    # 5. Cek titik pemantauan spesifik T1 - T5
     code_match = re.search(r"\bt([1-5])\b", q)
     if code_match:
         target_code = f"T{code_match.group(1)}"
         pt = next((p for p in snap["points"] if p["code"] == target_code), None)
         if pt:
             dom = ", ".join(pt["top_cats"]) if pt["top_cats"] else "belum ada dominasi kategori"
-            rel_ev = [e for e in snap["events"] if e["point_code"] == target_code]
-            ev_txt = (
-                f" Kejadian terbaru di {target_code}: **{rel_ev[0]['category']}** ({rel_ev[0]['count']} objek, status *{rel_ev[0]['status']}*) pada {rel_ev[0]['time']}."
-                if rel_ev else ""
-            )
             return (
-                f"Kondisi **{pt['code']} ({pt['name']} · {pt['zone']})** saat ini berstatus kepadatan **{pt['density']}** "
-                f"dengan total **{pt['total']} objek** sampah tercatat. Jenis terbanyak: {dom}.{ev_txt}"
+                f"Berdasarkan data pemantauan terbaru di **{pt['code']} ({pt['name']} · {pt['zone']})**, tingkat kepadatannya berada pada level **{pt['density']}** "
+                f"dengan total **{pt['total']} objek** sampah terdeteksi. Komposisi paling dominan berasal dari {dom}."
             )
 
-    # Cek pertanyaan tentang jenis / kategori sampah
-    if any(k in q for k in ("jenis sampah", "kategori sampah", "macam sampah", "plastik", "botol", "kemasan", "kertas", "kardus", "organik", "styrofoam", "logam", "kaca")):
-        cat_lines = []
-        for c in CATEGORIES[:8]:
-            cname = c.get("name") or c.get("category") or str(c)
-            cdesc = c.get("description") or c.get("desc") or ""
-            cat_lines.append(f"• **{cname}**" + (f": {cdesc}" if cdesc else ""))
-        return (
-            "Sistem ARINA memantau beberapa kategori sampah utama di alur sungai:\n"
-            + "\n".join(cat_lines)
-            + "\n\nSampah plastik (seperti botol, kantong plastik, dan kemasan makanan) mendominasi temuan karena sulit terurai dan mudah terbawa arus dari hulu ke hilir."
-        )
-
-    # Cek pertanyaan tentang cara melapor / menggunakan peta
-    if any(k in q for k in ("cara lapor", "melaporkan", "titik baru", "penitikan", "street view")):
-        return (
-            "Untuk melaporkan tumpukan sampah baru:\n"
-            "1. Buka halaman **Peta Titik Rawan**.\n"
-            "2. Gulir ke panel **Penitikan Koordinat Baru** di bawah peta (atau klik ikon **Layer → Titik Baru**).\n"
-            "3. Tekan **Lokasi Saya (GPS)** atau ketuk langsung posisi di peta, unggah foto lokasi, lalu kirim agar segera diverifikasi petugas."
-        )
-
-    # Default: ringkasan kondisi terbaru & titik paling menumpuk
+    # 6. Ringkasan kondisi sungai terkini
     pts_sorted = sorted(snap["points"], key=lambda x: x["total"], reverse=True)
-    high_pts = [p for p in snap["points"] if p["density"] == "Tinggi"]
     top_pt = pts_sorted[0] if pts_sorted else None
+    latest_ev = snap["events"][0] if snap["events"] else None
 
-    lines = []
-    if high_pts:
-        high_str = ", ".join(f"**{p['code']} ({p['zone']}, {p['total']} objek)**" for p in high_pts)
-        lines.append(f"⚠️ **Titik Kepadatan Tinggi Saat Ini:** {high_str}.")
-    elif top_pt:
-        lines.append(f"📍 **Titik Terpadat Saat Ini:** **{top_pt['code']} ({top_pt['zone']})** dengan **{top_pt['total']} objek** (kepadatan {top_pt['density']}).")
-
-    if snap["events"]:
-        ev = snap["events"][0]
-        lines.append(
-            f"🕒 **Temuan Terbaru di Log:** **{ev['category']}** ({ev['count']} objek, kepadatan {ev['density']}) "
-            f"terdeteksi di **{ev['point_code']} ({ev['zone']})** pada {ev['time']} — status *{ev['status']}*."
+    parts = []
+    if top_pt:
+        parts.append(
+            f"Secara keseluruhan di Sungai Karangantu, titik dengan akumulasi tertinggi saat ini adalah **{top_pt['code']} ({top_pt['zone']})** "
+            f"dengan **{top_pt['total']} objek** sampah (kepadatan **{top_pt['density']}**)."
         )
-
-    if snap["reports"]:
-        rp = snap["reports"][0]
-        lines.append(f"📌 **Laporan Warga Tervalidasi:** {rp['location']} (kepadatan {rp['density']}, {rp['time']}).")
-
-    lines.append(f"Saat ini terdapat **{snap['pending_events']} kejadian** yang masih menunggu penanganan petugas.")
-    return "\n\n".join(lines)
+    if latest_ev:
+        parts.append(
+            f"Temuan terbaru yang masuk ke sistem adalah **{latest_ev['category']}** ({latest_ev['count']} objek) di **{latest_ev['point_code']} ({latest_ev['zone']})** "
+            f"pada {latest_ev['time']} dengan status *{latest_ev['status']}*."
+        )
+    parts.append(
+        "Kalau kamu ingin membedah sisi ilmiahnya — seperti bagaimana proses polimer terurai, dampak mikroplastik bagi biota sungai, atau meminta **tautan jurnal & PDF penelitian** — silakan tanyakan saja!"
+    )
+    return "\n\n".join(parts)
 
 
 @app.post("/api/ai/chat")
@@ -518,20 +511,20 @@ def ai_chat(body: AiChatIn, db: Session = Depends(get_db), _: dict = Depends(req
     msg = (body.message or "").strip()
     if not msg:
         raise HTTPException(400, "Pertanyaan tidak boleh kosong.")
-    if len(msg) > 600:
-        raise HTTPException(400, "Pertanyaan terlalu panjang (maksimal 600 karakter).")
+    if len(msg) > 800:
+        raise HTTPException(400, "Pertanyaan terlalu panjang (maksimal 800 karakter).")
 
-    # Lapis 1: Tolak keras pertanyaan seputar kredensial, email, sandi, atau data akun
+    # Guardrail 1: Tolak tegas pertanyaan seputar kredensial, email, sandi, atau data akun petugas
     if SENSITIVE_PATTERN.search(msg):
         return {
-            "reply": "Maaf, saya tidak tahu dan tidak memiliki akses terhadap email, kata sandi, maupun data akun petugas atau pengguna. Saya hanya dapat menjawab pertanyaan seputar jenis sampah dan kondisi pemantauan sungai ARINA.",
+            "reply": "Maaf, saya tidak tahu dan tidak memiliki akses terhadap email, kata sandi, maupun data akun petugas atau pengguna. Saya hanya dapat berdiskusi seputar ilmu sampah, limbah, dampak lingkungan, dan pemantauan sungai ARINA.",
             "guardrailed": True,
         }
 
-    # Lapis 2: Batasi hanya pada topik sampah, sungai, dan sistem ARINA
+    # Guardrail 2: Jaga tetap di koridor ilmu sampah, limbah, lingkungan, & pemantauan ARINA
     if not DOMAIN_PATTERN.search(msg):
         return {
-            "reply": "Maaf, saya hanya dirancang untuk menjawab pertanyaan seputar pemantauan sampah sungai ARINA, jenis-jenis sampah, serta informasi penumpukan sampah di titik pemantauan (T1–T5).",
+            "reply": "Topik itu berada di luar ruang lingkup saya. Yuk kita diskusikan hal-hal seputar sampah, limbah, dampak penumpukannya di sungai, atau referensi jurnal penelitian lingkungan!",
             "guardrailed": True,
         }
 
@@ -541,16 +534,18 @@ def ai_chat(body: AiChatIn, db: Session = Depends(get_db), _: dict = Depends(req
     if api_key:
         try:
             sys_prompt = (
-                "Kamu adalah ARINA, asisten AI resmi untuk website pemantauan sampah Sungai Karangantu. "
+                "Kamu adalah ARINA, asisten AI berwawasan lingkungan dan ilmiah untuk website pemantauan Sungai Karangantu. "
+                "Gaya bicaramu hangat, mengalir, cerdas, tidak kaku, dan edukatif. "
                 "ATURAN WAJIB: "
-                "1. Jawab HANYA pertanyaan tentang jenis sampah, pengelolaan sampah sungai, dan data pemantauan ARINA berikut. "
-                "2. JANGAN PERNAH memberikan atau mengarang email, kata sandi, nomor telepon, atau data akun petugas/pengguna; jika ditanya jawab 'Maaf, saya tidak tahu.' "
-                "3. Jawab ringkas, ramah, dalam Bahasa Indonesia yang jelas berdasarkan data terkini ini:\n"
+                "1. Jelaskan konsep fundamental tentang sampah, limbah, degradasi material, dan dampak penumpukan sampah secara mendalam namun mudah dipahami. "
+                "2. Jika pengguna menanyakan sumber data atau meminta artikel penelitian (misal lama botol plastik terurai), jelaskan mekanisme ilmiahnya dan sertakan referensi jurnal peneliti asli lengkap dengan format tautan Markdown [Judul/Sumber](https://...) menuju DOI atau PDF terbuka. "
+                "3. DILARANG KERAS memberikan atau mengarang email, kata sandi, nomor telepon, atau data akun petugas/pengguna; jika ditanya jawab 'Maaf, saya tidak tahu.' "
+                "4. Gunakan data pemantauan sungai terkini berikut jika pengguna menanyakan kondisi titik:\n"
                 f"{json.dumps(snap, ensure_ascii=False)}"
             )
             payload = {
                 "contents": [{"parts": [{"text": f"{sys_prompt}\n\nPertanyaan pengguna: {msg}"}]}],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 450},
+                "generationConfig": {"temperature": 0.45, "maxOutputTokens": 700},
             }
             req = urllib.request.Request(
                 f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
@@ -558,7 +553,7 @@ def ai_chat(body: AiChatIn, db: Session = Depends(get_db), _: dict = Depends(req
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
                 text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
                 if text:
