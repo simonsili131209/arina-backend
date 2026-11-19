@@ -4,7 +4,9 @@ from datetime import datetime, timedelta
 import json
 import os
 import re
+import ssl
 from typing import Optional
+import urllib.error
 import urllib.request
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -358,7 +360,7 @@ def update_status(event_id: int, body: StatusIn, db: Session = Depends(get_db),
     return event_out(e, db.get(Point, e.point_code))
 
 
-# ----------------------------------------------------------------- asisten AI ARINA (Gemini LLM + Fallback Pengetahuan Sains)
+# ----------------------------------------------------------------- asisten AI ARINA (Gemini LLM + Fallback Cerdas)
 class ChatTurn(BaseModel):
     role: str
     text: str
@@ -373,6 +375,10 @@ SENSITIVE_PATTERN = re.compile(
     r"\b(email|e-mail|sandi|password|pass|kata\s*sandi|login|masuk\s*akun|username|user\s*id|token|jwt|secret|kredensial|hack|bobol|nomor\s*hp|telepon|whatsapp|wa\s*petugas|alamat\s*rumah)\b",
     re.IGNORECASE,
 )
+
+
+def get_gemini_key() -> str:
+    return (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
 
 
 def build_river_snapshot(db: Session) -> dict:
@@ -412,10 +418,77 @@ def build_river_snapshot(db: Session) -> dict:
     }
 
 
+def call_gemini_llm(msg: str, history: list[ChatTurn], snap: dict, api_key: str) -> tuple[Optional[str], str]:
+    persona_prompt = (
+        "Kamu adalah ARINA, asisten AI berwawasan luas, hangat, empatik, dan cerdas pada platform pemantauan Sungai Karangantu.\n"
+        "KEMAMPUAN & GAYA KOMUNIKASI:\n"
+        "- Pahami maksud pengguna secara fleksibel meskipun ada salah ketik (typo), singkatan, atau bahasa sehari-hari yang santai.\n"
+        "- Jawab langsung inti pertanyaan pengguna terlebih dahulu secara akurat dan mendalam, lalu berikan konteks atau prediksi lanjutan yang relevan (seperti cara kerja Gemini/Claude).\n"
+        "- Jelaskan konsep fundamental sampah, limbah B3, kimia polimer, mikroplastik, kesehatan lingkungan, hingga dampak penumpukan di sungai dengan bahasa yang mengalir dan mudah dipahami.\n"
+        "- Jika pengguna bertanya sumber data ilmiah atau meminta artikel/jurnal peneliti (misalnya lama penguraian botol plastik ~450 tahun, toksisitas sampah, atau pencemaran sungai), jelaskan mekanisme ilmiahnya serta lampirkan referensi jurnal peneliti asli dengan tautan Markdown [Judul/Sumber](https://...) menuju DOI atau file PDF terbuka.\n"
+        "- DILARANG KERAS memberikan, menebak, atau mengarang email, kata sandi, nomor telepon, atau data akun petugas/pengguna. Jika ditanya, jawab singkat: 'Maaf, saya tidak tahu.'\n"
+        "- Jika pengguna bertanya di luar topik lingkungan/sampah/sungai/sapaan wajar, arahkan kembali dengan ramah tanpa terdengar kaku.\n"
+        f"- Data pemantauan Sungai Karangantu terkini (pakai hanya jika relevan): {json.dumps(snap, ensure_ascii=False)}"
+    )
+
+    contents = [
+        {
+            "role": "user",
+            "parts": [{"text": f"[INSTRUKSI SISTEM ARINA]\n{persona_prompt}\n\nMulai percakapan dengan pengguna."}],
+        },
+        {
+            "role": "model",
+            "parts": [{"text": "Siap! Saya ARINA, siap berdiskusi secara cerdas, luwes, dan berbasis data ilmiah mengenai sampah, limbah, dan pemantauan sungai."}],
+        },
+    ]
+
+    for turn in (history or [])[-8:]:
+        role = "model" if turn.role == "assistant" else "user"
+        clean_txt = (turn.text or "").strip()
+        if clean_txt:
+            contents.append({"role": role, "parts": [{"text": clean_txt}]})
+
+    contents.append({"role": "user", "parts": [{"text": msg}]})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.65,
+            "maxOutputTokens": 950,
+        },
+    }
+    encoded_body = json.dumps(payload).encode("utf-8")
+    ctx = ssl.create_default_context()
+
+    last_err = ""
+    for model_name in ("gemini-2.5-flash", "gemini-2.0-flash"):
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            req = urllib.request.Request(
+                url,
+                data=encoded_body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+                candidates = raw.get("candidates") or []
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts") or []
+                    text = "".join(p.get("text", "") for p in parts).strip()
+                    if text:
+                        return text, model_name
+        except urllib.error.HTTPError as he:
+            last_err = f"HTTP {he.code}"
+        except Exception as ex:
+            last_err = type(ex).__name__
+
+    return None, last_err or "unavailable"
+
+
 def local_arina_reply(msg: str, snap: dict) -> str:
     q = msg.strip().lower()
 
-    # 1. Sapaan hangat
     if re.fullmatch(r"(halo|hai|hi|hello|assalamualaikum|selamat\s*(pagi|siang|sore|malam)|p|tes|test)[!.? ]*", q):
         return (
             "Halo! Senang bisa ngobrol denganmu. Saya **ARINA**, asisten cerdas seputar ilmu lingkungan, "
@@ -423,63 +496,41 @@ def local_arina_reply(msg: str, snap: dict) -> str:
             "Apa yang sedang bikin kamu penasaran?"
         )
 
-    # 2. Sampah paling berbahaya jika aroma/uap/gasnya terhirup hidung
-    if any(k in q for k in ("aroma", "hirup", "bau", "hidung", "napas", "paru", "gas", "asap", "uap", "sesak", "pusing")):
+    # Pertanyaan tentang sampah paling berbahaya (umum maupun terhirup)
+    if any(k in q for k in ("berbahaya", "berbaya", "bahaya", "racun", "toksik", "mematikan", "paling parah")):
         return (
-            "Jika dilihat dari risiko inhalasi (terhirup oleh hidung dan masuk ke paru-paru), ada **3 kelompok sampah & limbah yang paling berbahaya**:\n\n"
-            "1. **Limbah B3 & Pelarut Kimia (Kaleng cat, tiner, pestisida, baterai rusak, pembersih kimia):**\n"
-            "   • Melepaskan **senyawa organik volatil (VOC)** seperti benzena, toluena, serta uap merkuri/klorin yang langsung mengiritasi saluran pernapasan, merusak sistem saraf pusat, dan bersifat karsinogenik.\n"
-            "2. **Sampah Plastik & PVC yang Terbakar atau Terdegradasi Panas:**\n"
-            "   • Menghasilkan gas **dioksin, furan, dan stirena** (terutama dari PVC dan styrofoam). Dioksin sangat beracun bahkan pada konsentrasi sangat rendah karena memicu gangguan hormon, kerusakan hati, dan kanker paru.\n"
-            "3. **Tumpukan Sampah Organik Basah yang Membusuk Anaerob (Tanpa Oksigen) di Dasar Sungai:**\n"
-            "   • Menghasilkan gas **Hidrogen Sulfida ($\text{H}_2\text{S}$)** berbau telur busuk dan **Amonia ($\text{NH}_3$)**. Pada kadar tinggi, $\text{H}_2\text{S}$ dapat melumpuhkan saraf penciuman secara tiba-tiba, memicu edema paru, hingga kehilangan kesadaran.\n\n"
-            "**Referensi Ilmiah Toksisitas Gas Sampah:**\n"
-            "• **Verma, R. et al. (2016)** — *Toxic Pollutants from Plastic Waste — A Review* ([Baca & Unduh PDF Procedia Environmental Sciences](https://pdf.sciencedirectassets.com/278653/1-s2.0-S1878029616X00037/1-s2.0-S187802961630158X/main.pdf))\n"
-            "• **WHO (2010)** — *WHO Guidelines for Indoor Air Quality: Selected Pollutants (Benzene & VOCs)* ([Unduh PDF WHO](https://iris.who.int/bitstream/handle/10665/260127/9789289002134-eng.pdf))"
+            "Jika diurutkan dari tingkat ancaman terhadap manusia dan ekosistem sungai, **sampah paling berbahaya** terbagi ke dalam tiga tingkatan utama:\n\n"
+            "1. **Limbah B3 (Bahan Berbahaya & Beracun) — Paling Akut:**\n"
+            "   • Contohnya baterai bekas, limbah elektronik (*e-waste*), kaleng pestisida, oli bekas, dan kemasan pelarut kimia. Satu baterai bocor saja dapat mencemari ribuan liter air dengan **merkuri, timbal, dan kadmium** yang merusak saraf dan ginjal.\n"
+            "2. **Sampah Medis & Infeksius:**\n"
+            "   • Jarum suntik, masker bekas, dan kemasan obat yang dibuang sembarangan berisiko menularkan patogen berbahaya langsung ke warga sekitar aliran sungai.\n"
+            "3. **Plastik Berlapis & PVC (Polivinil Klorida) — Paling Persisten:**\n"
+            "   • Sulit hancur ratusan tahun, terpecah menjadi **mikroplastik** yang menyerap polutan kimia dan masuk ke tubuh ikan, serta melepaskan gas karsinogenik **dioksin** bila dibakar.\n\n"
+            "Kalau kamu ingin tahu jenis sampah spesifik di titik sungai kita atau minta **referensi jurnal/PDF penelitiannya**, beri tahu saja ya!"
         )
 
-    # 3. Sumber data ilmiah, lama penguraian plastik, artikel & PDF peneliti
-    if any(k in q for k in ("artikel", "jurnal", "peneliti", "penelitian", "riset", "studi", "dari mana", "sumber data", "pdf", "referensi", "bukti", "terurai", "berapa lama", "450", "tahun", "degradasi")):
+    if any(k in q for k in ("aroma", "hirup", "bau", "hidung", "napas", "paru", "gas", "asap", "uap")):
         return (
-            "Estimasi bahwa **botol plastik (PET) membutuhkan sekitar 450 tahun** untuk terurai berasal dari pengukuran laju peluruhan permukaan polimer (*Specific Surface Degradation Rate* / SSDR) di lingkungan perairan dan sedimen.\n\n"
-            "**Mengapa botol plastik sulit sekali hancur di sungai?**\n"
-            "• Rantai polimer *Polyethylene Terephthalate* (PET) memiliki cincin aromatik yang sangat kaku dan hidrofobik sehingga enzim bakteri air tidak mampu memutus rantai karbonnya.\n"
-            "• Saat tenggelam di air keruh atau tertimbun lumpur sungai, sinar UV matahari terhalang sehingga proses fotodegradasi melambat drastis.\n\n"
+            "Dari sisi risiko pernapasan jika aroma/uapnya terhirup hidung, yang paling berbahaya adalah **uap pelarut kimia/cat (senyawa VOC)**, **asap pembakaran plastik PVC & styrofoam (gas dioksin dan stirena)**, serta **gas Hidrogen Sulfida (H2S)** dari pembusukan sampah organik tanpa oksigen di dasar sungai."
+        )
+
+    if any(k in q for k in ("artikel", "jurnal", "peneliti", "penelitian", "riset", "studi", "dari mana", "sumber data", "pdf", "referensi", "bukti", "terurai", "berapa lama", "450", "tahun")):
+        return (
+            "Estimasi bahwa **botol plastik (PET) membutuhkan sekitar 450 tahun** untuk terurai berasal dari pengukuran laju degradasi permukaan polimer (*Specific Surface Degradation Rate*) di lingkungan perairan dan sedimen.\n\n"
             "**Referensi Artikel & PDF Para Peneliti:**\n"
             "1. **Chamas, A. et al. (2020)** — *Degradation Rates of Plastics in the Environment* (ACS Sustainable Chemistry & Engineering).\n"
             "   • [Baca Jurnal (DOI)](https://doi.org/10.1021/acssuschemeng.9b06635) | [Unduh PDF Peneliti](https://pubs.acs.org/doi/pdf/10.1021/acssuschemeng.9b06635)\n"
             "2. **Jambeck, J. R. et al. (2015)** — *Plastic waste inputs from land into the ocean* (Science).\n"
-            "   • [Baca Jurnal (Science)](https://doi.org/10.1126/science.1260352) | [Unduh PDF](https://www.science.org/doi/pdf/10.1126/science.1260352)\n"
+            "   • [Unduh PDF Science](https://www.science.org/doi/pdf/10.1126/science.1260352)\n"
             "3. **Lebreton, L. et al. (2017)** — *River plastic emissions to the world's oceans* (Nature Communications).\n"
             "   • [Unduh PDF Open-Access](https://www.nature.com/articles/ncomms15611.pdf)"
         )
 
-    # 4. Konsep fundamental sampah vs limbah
-    if any(k in q for k in ("fundamental", "perbedaan sampah dan limbah", "apa itu limbah", "apa itu sampah", "pengertian", "organik", "anorganik", "b3", "mikroplastik")):
+    if any(k in q for k in ("fundamental", "perbedaan sampah dan limbah", "apa itu limbah", "apa itu sampah", "pengertian", "organik", "anorganik", "mikroplastik")):
         return (
-            "Secara fundamental dalam ilmu lingkungan:\n\n"
-            "• **Sampah (*Solid Waste*):** Sisa aktivitas harian manusia atau alam berbentuk padat (botol PET, kemasan makanan, sisa organik, kayu, kain).\n"
-            "• **Limbah (*Waste / Effluent*):** Buangan hasil proses industri, pertanian, maupun domestik yang dapat berwujud cair, gas, maupun padat — sering membawa beban pencemar kimia langsung ke sungai.\n\n"
-            "**Klasifikasi Fundamental:**\n"
-            "1. **Organik (*Biodegradable*):** Mudah terurai mikroba, namun penumpukan berlebih memicu pembusukan anaerob dan menurunkan oksigen terlarut air.\n"
-            "2. **Anorganik Persisten:** Sulit terurai secara biologis (plastik, styrofoam, kaca, logam) dan terfragmentasi menjadi **mikroplastik (< 5 mm)**.\n"
-            "3. **Limbah B3:** Mengandung logam berat atau senyawa toksik (baterai, oli, kaleng pestisida).\n\n"
-            "Referensi riset global:\n"
-            "• **Geyer, R., Jambeck, J. R., & Law, K. L. (2017)** — *Production, use, and fate of all plastics ever made* ([Unduh PDF Science Advances](https://www.science.org/doi/pdf/10.1126/sciadv.1700782))"
+            "Secara fundamental: **sampah** merujuk pada buangan padat hasil aktivitas harian (botol plastik, sisa makanan, kardus), sedangkan **limbah** mencakup buangan cair, gas, maupun padat dari proses industri/domestik yang sering membawa beban pencemar kimia ke sungai."
         )
 
-    # 5. Dampak penumpukan sampah di sungai
-    if any(k in q for k in ("dampak", "akibat", "bahaya", "banjir", "ekosistem", "ikan", "pencemaran", "polusi", "kesehatan")):
-        return (
-            "Penumpukan sampah di sungai memicu dampak berantai:\n\n"
-            "1. **Penyempitan Aliran & Banjir:** Sumbatan sampah di pilar jembatan mempersempit penampang basah sungai sehingga air meluap saat hujan deras.\n"
-            "2. **Hipoksia & Kematian Biota:** Pembusukan sampah menguras oksigen terlarut (*Dissolved Oxygen*) dan menghalangi cahaya matahari ke dasar sungai.\n"
-            "3. **Bioakumulasi Mikroplastik:** Fragmen plastik menyerap polutan kimia dan tertelan ikan muara sebelum akhirnya masuk ke rantai pangan manusia.\n\n"
-            "Rujukan ilmiah:\n"
-            "• **Barnes, D. K. A. et al. (2009)** — *Accumulation and fragmentation of plastic debris in global environments* ([Unduh PDF Royal Society](https://royalsocietypublishing.org/doi/pdf/10.1098/rstb.2008.0205))"
-        )
-
-    # 6. Titik spesifik T1 - T5
     code_match = re.search(r"\bt([1-5])\b", q)
     if code_match:
         target_code = f"T{code_match.group(1)}"
@@ -487,17 +538,22 @@ def local_arina_reply(msg: str, snap: dict) -> str:
         if pt:
             dom = ", ".join(pt["top_cats"]) if pt["top_cats"] else "belum ada dominasi kategori"
             return (
-                f"Berdasarkan data pemantauan terbaru di **{pt['code']} ({pt['name']} · {pt['zone']})**, tingkat kepadatannya berada pada level **{pt['density']}** "
-                f"dengan total **{pt['total']} objek** sampah terdeteksi. Komposisi dominan: {dom}."
+                f"Berdasarkan data terkini di **{pt['code']} ({pt['name']} · {pt['zone']})**, tingkat kepadatannya berada pada level **{pt['density']}** "
+                f"with total **{pt['total']} objek** sampah. Komposisi dominan: {dom}."
             )
 
     pts_sorted = sorted(snap["points"], key=lambda x: x["total"], reverse=True)
     top_pt = pts_sorted[0] if pts_sorted else None
     return (
-        f"Pertanyaan yang menarik! Di Sungai Karangantu sendiri, titik terpadat saat ini berada di **{top_pt['code']} ({top_pt['zone']})** ({top_pt['total']} objek)[cite: 16]. "
-        "Kalau kamu ingin membahas aspek spesifik — misalnya jenis sampah paling beracun, dampak bagi kesehatan & ekosistem, "
-        "atau meminta **referensi jurnal dan PDF para peneliti** — coba sebutkan detailnya ya!"
+        f"Di Sungai Karangantu saat ini, titik terpadat berada di **{top_pt['code']} ({top_pt['zone']})** ({top_pt['total']} objek). "
+        "Tanyakan apa saja seputar jenis sampah, dampaknya bagi kesehatan & ekosistem, atau minta referensi PDF penelitian!"
     )
+
+
+@app.get("/api/ai/status")
+def ai_status(_: dict = Depends(require_user)):
+    key = get_gemini_key()
+    return {"llm_configured": bool(key), "provider": "gemini" if key else "local"}
 
 
 @app.post("/api/ai/chat")
@@ -508,57 +564,22 @@ def ai_chat(body: AiChatIn, db: Session = Depends(get_db), _: dict = Depends(req
     if len(msg) > 1000:
         raise HTTPException(400, "Pertanyaan terlalu panjang (maksimal 1000 karakter).")
 
-    # Guardrail ketat khusus kredensial & data privasi akun petugas
     if SENSITIVE_PATTERN.search(msg):
         return {
             "reply": "Maaf, saya tidak tahu dan tidak memiliki akses terhadap email, kata sandi, maupun data akun petugas atau pengguna. Saya hanya dapat berdiskusi seputar ilmu sampah, limbah, dampak lingkungan, dan pemantauan sungai ARINA.",
-            "guardrailed": True,
+            "engine": "guardrail",
         }
 
     snap = build_river_snapshot(db)
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    api_key = get_gemini_key()
 
     if api_key:
-        try:
-            sys_prompt = (
-                "Kamu adalah ARINA, asisten AI cerdas, ramah, dan berwawasan ilmiah untuk platform pemantauan Sungai Karangantu. "
-                "Gaya bicaramu alami seperti teman diskusi yang pintar (seperti Gemini/Claude): tanggap terhadap typo pengguna, menjawab langsung ke inti pertanyaan dengan penjelasan mendalam namun mudah dicerna, dan tidak kaku. "
-                "ATURAN PENTING:\n"
-                "1. Jawab segala pertanyaan seputar sampah, limbah, kimia/toksikologi sampah, kesehatan lingkungan, mikroplastik, dampak penumpukan sampah di sungai, serta kondisi pemantauan sungai ARINA.\n"
-                "2. Jika pengguna bertanya sumber data ilmiah atau meminta artikel/jurnal peneliti (misal tentang lama penguraian plastik, gas beracun sampah, atau pencemaran sungai), jelaskan mekanisme ilmiahnya secara akurat dan lampirkan referensi peneliti asli menggunakan tautan Markdown [Judul/Sumber](https://...) menuju DOI atau file PDF terbuka yang valid.\n"
-                "3. DILARANG KERAS memberikan, menebak, atau mengarang email, kata sandi, nomor telepon, atau data akun petugas/pengguna. Jika ditanya, jawab singkat: 'Maaf, saya tidak tahu.'\n"
-                "4. Jika pertanyaan benar-benar di luar topik lingkungan, sampah, sungai, atau sapaan/obrolan wajar, arahkan kembali dengan ramah ke topik sampah & lingkungan.\n"
-                f"5. Data pemantauan sungai terkini (gunakan hanya jika relevan dengan pertanyaan): {json.dumps(snap, ensure_ascii=False)}"
-            )
+        llm_reply, detail = call_gemini_llm(msg, body.history, snap, api_key)
+        if llm_reply:
+            return {"reply": llm_reply, "engine": detail}
+        return {"reply": local_arina_reply(msg, snap), "engine": f"local ({detail})"}
 
-            contents = []
-            for turn in (body.history or [])[-8:]:
-                role = "model" if turn.role == "assistant" else "user"
-                clean_txt = (turn.text or "").strip()
-                if clean_txt:
-                    contents.append({"role": role, "parts": [{"text": clean_txt}]})
-            contents.append({"role": "user", "parts": [{"text": msg}]})
-
-            payload = {
-                "systemInstruction": {"parts": [{"text": sys_prompt}]},
-                "contents": contents,
-                "generationConfig": {"temperature": 0.55, "maxOutputTokens": 900},
-            }
-            req = urllib.request.Request(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw = json.loads(resp.read().decode("utf-8"))
-                text = raw["candidates"][0]["content"]["parts"][0]["text"].strip()
-                if text:
-                    return {"reply": text, "guardrailed": False}
-        except Exception:
-            pass
-
-    return {"reply": local_arina_reply(msg, snap), "guardrailed": False}
+    return {"reply": local_arina_reply(msg, snap), "engine": "local (no_key)"}
 
 
 @app.get("/api/alerts/latest")
