@@ -21,7 +21,7 @@ from auth import create_token, hash_password, require_admin, require_user, verif
 from categories import CATEGORIES, CATEGORY_NAMES, PLASTIC_NAMES
 from database import Base, SessionLocal, engine as db_engine, get_db
 from models import Event, MonthlyStat, Point, PointCategoryStat, PointReport, STATUS_FLOW, User
-from seed import seed_if_empty
+from seed import STAFF_NICKNAMES, seed_if_empty
 from video import engine as video_engine
 
 
@@ -52,6 +52,19 @@ app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 # ----------------------------------------------------------------- helpers
 def point_label(p: Point) -> str:
     return f"{p.code} · {p.zone.lower()}" if p.code in ("T1", "T5") else p.code
+
+
+def default_nickname(email: str, name: str) -> str:
+    clean_email = (email or "").strip().lower()
+    if clean_email in STAFF_NICKNAMES:
+        return STAFF_NICKNAMES[clean_email]
+    clean_name = (name or "").strip()
+    if not clean_name or clean_name == "Tamu":
+        return ""
+    before_dot = clean_name.split("·")[0].strip()
+    if before_dot.lower().startswith("petugas"):
+        return before_dot
+    return before_dot.split()[0]
 
 
 def event_out(e: Event, p: Point) -> dict:
@@ -104,6 +117,7 @@ class RegisterIn(BaseModel):
     name: str
     email: str
     password: str
+    nickname: Optional[str] = None
 
 
 class GoogleLoginIn(BaseModel):
@@ -116,7 +130,13 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == body.email.strip().lower()).first()
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(401, "Email atau password salah.")
-    info = {"sub": str(user.id), "email": user.email, "name": user.name, "role": user.role}
+    info = {
+        "sub": str(user.id),
+        "email": user.email,
+        "name": user.name,
+        "nickname": default_nickname(user.email, user.name),
+        "role": user.role,
+    }
     return {"token": create_token(info), "user": info}
 
 
@@ -124,6 +144,7 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
 def register(body: RegisterIn, db: Session = Depends(get_db)):
     clean_email = body.email.strip().lower()
     clean_name = body.name.strip()
+    clean_nick = (body.nickname or "").strip() or default_nickname(clean_email, clean_name)
     if not clean_name or not clean_email or len(body.password) < 6:
         raise HTTPException(400, "Nama, email, dan sandi minimal 6 karakter wajib diisi.")
     if db.query(User).filter(User.email == clean_email).first():
@@ -137,7 +158,13 @@ def register(body: RegisterIn, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
-    info = {"sub": str(user.id), "email": user.email, "name": user.name, "role": user.role}
+    info = {
+        "sub": str(user.id),
+        "email": user.email,
+        "name": user.name,
+        "nickname": clean_nick,
+        "role": user.role,
+    }
     return {"token": create_token(info), "user": info}
 
 
@@ -158,20 +185,28 @@ def login_google(body: GoogleLoginIn, db: Session = Depends(get_db)):
         db.add(user)
         db.commit()
         db.refresh(user)
-    info = {"sub": str(user.id), "email": user.email, "name": user.name, "role": user.role}
+    info = {
+        "sub": str(user.id),
+        "email": user.email,
+        "name": user.name,
+        "nickname": default_nickname(user.email, user.name),
+        "role": user.role,
+    }
     return {"token": create_token(info), "user": info}
 
 
 @app.post("/api/auth/guest")
 def guest():
     guest_id = f"guest_{os.urandom(4).hex()}"
-    info = {"sub": guest_id, "email": "", "name": "Tamu", "role": "guest"}
+    info = {"sub": guest_id, "email": "", "name": "Tamu", "nickname": "", "role": "guest"}
     return {"token": create_token(info), "user": info}
 
 
 @app.get("/api/auth/me")
 def me(user: dict = Depends(require_user)):
-    return {"user": {k: user[k] for k in ("sub", "email", "name", "role")}}
+    out = {k: user[k] for k in ("sub", "email", "name", "role") if k in user}
+    out["nickname"] = user.get("nickname") or default_nickname(out.get("email", ""), out.get("name", ""))
+    return {"user": out}
 
 
 # ----------------------------------------------------------------- peta & titik
@@ -377,6 +412,8 @@ SENSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_CACHED_WORKING_MODEL: Optional[str] = None
+
 
 def get_gemini_key() -> str:
     raw = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
@@ -384,26 +421,29 @@ def get_gemini_key() -> str:
 
 
 def discover_available_models(api_key: str, ctx: ssl.SSLContext) -> list[str]:
-    """Ambil daftar model Gemini aktif langsung dari API key agar tidak pernah kena HTTP 404."""
-    try:
-        req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
-            method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            found = []
-            for m in data.get("models") or []:
-                methods = m.get("supportedGenerationMethods") or []
-                name = m.get("name") or ""
-                if "generateContent" in methods and "gemini" in name.lower():
-                    clean_name = name.replace("models/", "")
-                    found.append(clean_name)
-            # Prioritaskan varian flash terbaru
-            found.sort(key=lambda x: (0 if "flash" in x else 1, 0 if "2.5" in x or "2.0" in x else 1))
-            return found[:4]
-    except Exception:
-        return []
+    """Ambil daftar model Gemini aktif langsung dari endpoint API Google agar bebas HTTP 404."""
+    found: list[str] = []
+    for ver in ("v1beta", "v1"):
+        try:
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/{ver}/models?key={api_key}",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                for m in data.get("models") or []:
+                    methods = m.get("supportedGenerationMethods") or []
+                    name = m.get("name") or ""
+                    if "generateContent" in methods and "gemini" in name.lower():
+                        clean_name = name.replace("models/", "")
+                        if clean_name not in found:
+                            found.append(clean_name)
+                if found:
+                    break
+        except Exception:
+            continue
+    found.sort(key=lambda x: (0 if "flash" in x else 1, 0 if "2.5" in x or "2.0" in x else 1))
+    return found[:6]
 
 
 def build_river_snapshot(db: Session) -> dict:
@@ -450,8 +490,13 @@ def call_gemini_llm(
     api_key: str,
     nickname: Optional[str],
 ) -> tuple[Optional[str], str]:
+    global _CACHED_WORKING_MODEL
+
     call_name = (nickname or "").strip()
-    user_ref = f"Nama panggilan pengguna saat ini adalah '{call_name}'. Gunakan namanya sesekali secara alami dan akrab." if call_name else ""
+    user_ref = (
+        f"Nama panggilan pengguna adalah '{call_name}'. Sapa dan sebut namanya sesekali secara alami dan akrab."
+        if call_name else ""
+    )
 
     persona_prompt = (
         "Kamu adalah ARINA, asisten AI berwawasan luas, cerdas, luwes, dan empatik pada platform pemantauan Sungai Karangantu.\n"
@@ -495,50 +540,62 @@ def call_gemini_llm(
     encoded_body = json.dumps(payload).encode("utf-8")
     ctx = ssl.create_default_context()
 
-    candidates_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    initial_models = []
+    if _CACHED_WORKING_MODEL:
+        initial_models.append(_CACHED_WORKING_MODEL)
+    initial_models.extend([
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-flash-latest",
+        "gemini-1.5-flash",
+    ])
+
     tried = set()
     last_err = ""
 
     def try_models(model_list: list[str]) -> tuple[Optional[str], str]:
+        global _CACHED_WORKING_MODEL
         nonlocal last_err
         for model_name in model_list:
             if model_name in tried:
                 continue
             tried.add(model_name)
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-                req = urllib.request.Request(
-                    url,
-                    data=encoded_body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=14, context=ctx) as resp:
-                    raw = json.loads(resp.read().decode("utf-8"))
-                    cands = raw.get("candidates") or []
-                    if cands:
-                        parts = cands[0].get("content", {}).get("parts") or []
-                        text = "".join(p.get("text", "") for p in parts).strip()
-                        if text:
-                            return text, model_name
-            except urllib.error.HTTPError as he:
-                err_body = ""
+            for ver in ("v1beta", "v1"):
                 try:
-                    err_body = he.read().decode("utf-8")[:120]
-                except Exception:
-                    pass
-                last_err = f"HTTP {he.code} ({model_name})"
-                if he.code in (400, 403) and "API_KEY_INVALID" in err_body:
-                    break
-            except Exception as ex:
-                last_err = f"{type(ex).__name__}"
+                    url = f"https://generativelanguage.googleapis.com/{ver}/models/{model_name}:generateContent?key={api_key}"
+                    req = urllib.request.Request(
+                        url,
+                        data=encoded_body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=14, context=ctx) as resp:
+                        raw = json.loads(resp.read().decode("utf-8"))
+                        cands = raw.get("candidates") or []
+                        if cands:
+                            parts = cands[0].get("content", {}).get("parts") or []
+                            text = "".join(p.get("text", "") for p in parts).strip()
+                            if text:
+                                _CACHED_WORKING_MODEL = model_name
+                                return text, model_name
+                except urllib.error.HTTPError as he:
+                    err_body = ""
+                    try:
+                        err_body = he.read().decode("utf-8")[:140]
+                    except Exception:
+                        pass
+                    last_err = f"HTTP {he.code} ({model_name})"
+                    if he.code in (400, 403) and "API_KEY_INVALID" in err_body:
+                        return None, ""
+                except Exception as ex:
+                    last_err = type(ex).__name__
         return None, ""
 
-    reply, ok_model = try_models(candidates_models)
+    reply, ok_model = try_models(initial_models)
     if reply:
         return reply, ok_model
 
-    # Jika daftar default kena 404, cari model aktif langsung dari endpoint /v1beta/models
     discovered = discover_available_models(api_key, ctx)
     if discovered:
         reply, ok_model = try_models(discovered)
@@ -553,19 +610,19 @@ def local_arina_reply(msg: str, snap: dict) -> str:
 
     if any(k in q for k in ("banten", "ciujung", "cisadane", "cibanten", "cidurian", "selain karangantu")):
         return (
-            "Selain **Sungai Karangantu**, ada beberapa aliran sungai besar di wilayah **Banten** yang kerap menghadapi tekanan penumpukan sampah dan limbah:\n\n"
-            "1. **Sungai Cisadane (Tangerang Raya):** Menanggung beban sampah domestik padat penduduk serta limbah industri di bagian tengah hingga hilir sebelum bermuara ke Laut Jawa.\n"
-            "2. **Sungai Ciujung (Serang – Lebak):** Salah satu DAS terbesar di Banten yang rawan akumulasi sampah rumah tangga dan limbah industri di kawasan hilir.\n"
-            "3. **Sungai Cibanten (Kota Serang):** Melintasi pusat permukiman dan pasar sehingga sering mengalami penyempitan aliran akibat plastik kemasan dan sampah organik.\n"
-            "4. **Sungai Cidurian (Tangerang – Serang):** Rawan tumpukan sampah kiriman dari hulu saat debit hujan meningkat."
+            "Selain **Sungai Karangantu**, beberapa sungai besar di wilayah **Banten** yang sering mengalami tekanan penumpukan sampah dan limbah antara lain:\n\n"
+            "1. **Sungai Cisadane (Tangerang Raya):** Menanggung beban sampah domestik padat penduduk dan limbah industri sebelum bermuara ke Laut Jawa.\n"
+            "2. **Sungai Ciujung (Serang – Lebak):** Rawan akumulasi sampah rumah tangga dan limbah industri di bagian tengah hingga hilir.\n"
+            "3. **Sungai Cibanten (Kota Serang):** Melintasi pusat permukiman dan pasar sehingga rawan penyempitan aliran akibat plastik kemasan.\n"
+            "4. **Sungai Cidurian (Tangerang – Serang):** Sering membawa sampah kiriman dari hulu saat debit hujan meningkat."
         )
 
     if any(k in q for k in ("berbahaya", "berbaya", "bahaya", "racun", "toksik", "mematikan", "paling parah")):
         return (
-            "Jika dilihat dari dampak toksisitas terhadap manusia dan ekosistem, **sampah paling berbahaya** terbagi dalam 3 kelompok utama:\n\n"
+            "Jika dilihat dari ancaman terhadap kesehatan manusia dan ekosistem sungai, **sampah paling berbahaya** terbagi dalam 3 kelompok utama:\n\n"
             "1. **Limbah B3 & Elektronik (*E-waste*):** Baterai bekas, lampu neon, kaleng pestisida, dan oli melepaskan logam berat (**merkuri, timbal, kadmium**) yang merusak saraf dan mencemari air.\n"
             "2. **Sampah Medis & Infeksius:** Jarum suntik, masker bekas, dan limbah farmasi yang membawa patogen menular.\n"
-            "3. **Plastik PVC & Berlapis (*Multilayer*):** Terurai ratusan tahun menjadi **mikroplastik** dan melepaskan gas karsinogenik **dioksin** bila terbakar."
+            "3. **Plastik PVC & Berlapis (*Multilayer*):** Terurai ratusan tahun menjadi **mikroplastik** dan melepaskan gas karsinogenik **dioksin** bila dibakar."
         )
 
     if any(k in q for k in ("artikel", "jurnal", "peneliti", "penelitian", "riset", "studi", "dari mana", "sumber data", "pdf", "referensi", "bukti", "terurai", "berapa lama", "450", "tahun")):
@@ -587,7 +644,10 @@ def local_arina_reply(msg: str, snap: dict) -> str:
 @app.get("/api/ai/status")
 def ai_status(_: dict = Depends(require_user)):
     key = get_gemini_key()
-    return {"llm_configured": bool(key), "provider": "gemini" if key else "local"}
+    return {
+        "llm_configured": bool(key),
+        "model": _CACHED_WORKING_MODEL or ("auto" if key else "local"),
+    }
 
 
 @app.post("/api/ai/chat")

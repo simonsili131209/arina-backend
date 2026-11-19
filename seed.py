@@ -9,12 +9,15 @@ from categories import CATEGORIES, CATEGORY_NAMES
 from config import SNAPSHOT_DIR
 from models import Event, MonthlyStat, Point, PointCategoryStat, STATUS_FLOW, User
 
+# (email, nama_lengkap, nama_panggilan, password)
 OFFICIAL_STAFF = [
-    ("petugas1@arina.id", "Petugas 1 · Koordinator", "ArinaPetugas#01"),
-    ("petugas2@arina.id", "Petugas 2 · Lapangan", "ArinaPetugas#02"),
-    ("admin@arina.id", "Admin Utama ARINA", "ArinaAdmin#2026"),
-    ("lapangan@arina.id", "Petugas 4 · Pemantau", "ArinaLapangan#04"),
+    ("petugas1@arina.id", "Petugas 1 · Koordinator", "Petugas 1", "ArinaPetugas#01"),
+    ("petugas2@arina.id", "Petugas 2 · Lapangan", "Petugas 2", "ArinaPetugas#02"),
+    ("admin@arina.id", "Admin Utama ARINA", "Admin", "ArinaAdmin#2026"),
+    ("lapangan@arina.id", "Petugas 4 · Pemantau", "Petugas 4", "ArinaLapangan#04"),
 ]
+
+STAFF_NICKNAMES = {email: nick for email, _, nick, _ in OFFICIAL_STAFF}
 
 POINTS = [
     ("T1", "Titik 1", "Hulu",         -6.042250, 106.161917, "6°02'32.1\"S 106°09'42.9\"E", "Tinggi"),
@@ -71,12 +74,13 @@ def _snapshot(path, point_code, category, count, ts, color_hex, seed):
 
 
 def seed_if_empty(db: Session) -> None:
-    # Pastikan 4 akun resmi petugas selalu tersedia
-    for email, name, raw_pw in OFFICIAL_STAFF:
+    # Pastikan 4 akun resmi petugas selalu aktif & tersinkronisasi
+    for email, full_name, _nick, raw_pw in OFFICIAL_STAFF:
         existing = db.query(User).filter(User.email == email).first()
         if not existing:
-            db.add(User(email=email, name=name, password_hash=hash_password(raw_pw), role="admin"))
+            db.add(User(email=email, name=full_name, password_hash=hash_password(raw_pw), role="admin"))
         else:
+            existing.name = full_name
             existing.role = "admin"
             existing.password_hash = hash_password(raw_pw)
     db.commit()
