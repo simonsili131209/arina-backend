@@ -282,7 +282,7 @@ def register_request(body: RegisterIn, db: Session = Depends(get_db)):
         "nickname": clean_nick,
         "password_hash": hash_password(body.password),
         "otp": otp_code,
-        "exp": int(time.time()) + 900,  # 15 menit
+        "exp": int(time.time()) + 900,
     }
     v_token = sign_verification_payload(payload)
 
@@ -598,7 +598,7 @@ def update_status(event_id: int, body: StatusIn, db: Session = Depends(get_db),
     return event_out(e, db.get(Point, e.point_code))
 
 
-# ----------------------------------------------------------------- asisten AI ARINA (Gemini Auto-Discovery LLM)
+# ----------------------------------------------------------------- asisten AI ARINA (Fast-Path + Bunglon Gaya Bahasa)
 class ChatTurn(BaseModel):
     role: str
     text: str
@@ -615,7 +615,65 @@ SENSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+GREETING_TOKENS = {
+    "hai", "halo", "hallo", "hello", "hi", "hey", "hei", "helo", "p", "ping",
+    "tes", "test", "pagi", "siang", "sore", "malam", "selamat",
+    "assalamualaikum", "assalamu'alaikum", "salam",
+    "yo", "yoo", "yow", "oy", "oi", "woy", "cuy", "bro", "sis", "bestie", "min",
+    "arina", "juga", "dong", "nih", "ya", "kak", "bang", "mas", "mba", "mbak",
+    "apa", "kabar", "kabarmu", "kabarnya", "gimana", "gmn", "baik", "sehat",
+    "wkwk", "wkwkwk", "hehe", "haha", "mantap", "oke", "ok", "siap",
+    "makasih", "terima", "kasih", "thanks", "thx",
+}
+
+GAUL_HINTS = {
+    "yo", "yoo", "yow", "oy", "oi", "woy", "cuy", "bro", "bestie", "wkwk",
+    "wkwkwk", "gmn", "gimana", "nih", "dong", "gw", "gue", "lu", "lo",
+    "anjir", "gokil", "spill", "relate", "parah", "bgt", "banget", "sih",
+}
+
 _CACHED_WORKING_MODEL: Optional[str] = None
+
+
+def fast_smalltalk_reply(msg: str, nickname: Optional[str]) -> Optional[str]:
+    cleaned = re.sub(r"[^\w\s']", " ", msg.lower()).strip()
+    words = [w for w in cleaned.split() if w]
+    if not words or len(words) > 5:
+        return None
+    if not all(w in GREETING_TOKENS for w in words):
+        return None
+
+    nick = (nickname or "").strip()
+    call = f" {nick}" if nick else ""
+    is_gaul = any(w in GAUL_HINTS for w in words) or cleaned in ("hai juga", "halo juga", "p", "tes", "test")
+
+    if any(w in ("makasih", "terima", "kasih", "thanks", "thx") for w in words):
+        if is_gaul:
+            return secrets.choice([
+                f"Sama-sama{call}! Kalau ada yang mau diobrolin lagi soal sungai atau sampah, gas langsung tanya aja ya.",
+                f"Siap, santai aja{call}! Kabarin kapan aja kalau butuh info atau data titik sungai.",
+            ])
+        return f"Sama-sama{call}! Senang bisa membantu. Silakan tanyakan apa saja seputar pemantauan sungai dan pengelolaan sampah."
+
+    if any(w in ("kabar", "kabarmu", "kabarnya", "gimana", "gmn") for w in words):
+        if is_gaul:
+            return secrets.choice([
+                f"Aman terkendali{call}! Sistem pantau sungai lagi on fire nih. Lu sendiri gimana, ada yang mau di-spill atau ditanyain?",
+                f"Kabar baik banget{call}! Lagi standby mantau kondisi sungai nih. Mau bahas apa kita hari ini?",
+            ])
+        return f"Kabar baik{call}! Sistem pemantauan ARINA siap menemani diskusi. Ada topik sampah atau kondisi sungai yang ingin dibahas?"
+
+    if is_gaul:
+        return secrets.choice([
+            f"Hai juga{call}! Gimana nih, mau ngobrolin kondisi Sungai Karangantu, dampak sampah plastik, atau lagi nyari referensi riset?",
+            f"Yo hai{call}! Santai aja di sini, mau bahas soal sampah, limbah, atau kondisi sungai mana nih?",
+            f"Hai{call}! Siap nemenin diskusi nih—mau nanya hal serius soal lingkungan atau ngobrol santai soal sampah sungai, gas aja!",
+        ])
+
+    return secrets.choice([
+        f"Hai juga{call}! Senang menyapa kamu. Ada hal seputar sampah, limbah, atau kondisi Sungai Karangantu yang ingin kita diskusikan?",
+        f"Halo{call}! Saya ARINA, siap membantu. Topik lingkungan atau data titik sungai mana yang ingin kamu bahas?",
+    ])
 
 
 def get_gemini_key() -> str:
@@ -625,27 +683,24 @@ def get_gemini_key() -> str:
 
 def discover_available_models(api_key: str, ctx: ssl.SSLContext) -> list[str]:
     found: list[str] = []
-    for ver in ("v1beta", "v1"):
-        try:
-            req = urllib.request.Request(
-                f"https://generativelanguage.googleapis.com/{ver}/models?key={api_key}",
-                method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                for m in data.get("models") or []:
-                    methods = m.get("supportedGenerationMethods") or []
-                    name = m.get("name") or ""
-                    if "generateContent" in methods and "gemini" in name.lower():
-                        clean_name = name.replace("models/", "")
-                        if clean_name not in found:
-                            found.append(clean_name)
-                if found:
-                    break
-        except Exception:
-            continue
-    found.sort(key=lambda x: (0 if "flash" in x else 1, 0 if "2.5" in x or "2.0" in x else 1))
-    return found[:6]
+    try:
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for m in data.get("models") or []:
+                methods = m.get("supportedGenerationMethods") or []
+                name = m.get("name") or ""
+                if "generateContent" in methods and "gemini" in name.lower():
+                    clean_name = name.replace("models/", "")
+                    if clean_name not in found:
+                        found.append(clean_name)
+    except Exception:
+        pass
+    found.sort(key=lambda x: (0 if "2.0-flash" in x else 1, 0 if "flash" in x else 2))
+    return found[:4]
 
 
 def build_river_snapshot(db: Session) -> dict:
@@ -696,21 +751,23 @@ def call_gemini_llm(
 
     call_name = (nickname or "").strip()
     user_ref = (
-        f"Nama panggilan pengguna adalah '{call_name}'. Sapa dan sebut namanya sesekali secara alami dan akrab."
+        f"Nama panggilan pengguna adalah '{call_name}'. Sebut namanya sesekali secara alami dan akrab."
         if call_name else ""
     )
 
     persona_prompt = (
-        "Kamu adalah ARINA, asisten AI berwawasan luas, cerdas, luwes, dan empatik pada platform pemantauan Sungai Karangantu.\n"
+        "Kamu adalah ARINA, asisten AI berwawasan luas, cerdas, luwes, dan adaptif pada platform pemantauan Sungai Karangantu.\n"
         f"{user_ref}\n"
-        "GAYA BERPIKIR & BERBICARA:\n"
-        "- Kamu sepintar Gemini/Claude: tanggap terhadap typo, singkatan, maupun pertanyaan tersirat, dan mampu memprediksi kebutuhan informasi lanjutan pengguna.\n"
-        "- Jawab langsung ke inti pertanyaan dengan analisis yang jelas, konkret, dan mengalir—jangan kaku atau berbelit-belit.\n"
-        "- Kamu menguasai seluruh topik tentang persampahan, limbah domestik & industri, limbah B3, kimia polimer, mikroplastik, dampak kesehatan & ekologis, pengelolaan sungai di Banten (seperti Sungai Ciujung, Cisadane, Cibanten, Cidurian, Karangantu) maupun wilayah lain, serta riset ilmiah.\n"
-        "- Jika pengguna bertanya sumber data ilmiah atau meminta artikel/jurnal peneliti (misal lama penguraian botol plastik ~450 tahun, toksisitas sampah, atau pencemaran sungai), jelaskan mekanisme ilmiahnya dan sertakan referensi peneliti asli memakai tautan Markdown [Judul/Sumber](https://...) menuju DOI atau file PDF terbuka.\n"
+        "KEMAMPUAN ADAPTASI GAYA BAHASA (BUNGLON KOMUNIKASI):\n"
+        "- Amati gaya ketikan pengguna pada pesan terakhir dan riwayat chat!\n"
+        "- Jika pengguna memakai bahasa gaul / santai / kekinian (seperti 'gw/lu', 'cuy', 'bro', 'bestie', 'spill', 'gokil', 'parah banget', 'relate', 'wkwk', 'btw', singkatan santai), sesuaikan gaya bicaramu agar ikut santai, akrab, ekspresif, dan kekinian seperti teman ngobrol sepantaran yang asyik—namun penjelasan ilmiah dan datanya tetap tajam dan akurat.\n"
+        "- Jika pengguna memakai bahasa Indonesia yang sopan, semi-formal, atau akademis (misalnya menanyakan jurnal penelitian atau analisis teknis), gunakan bahasa yang rapi, jelas, dan profesional.\n"
+        "- Tanggap terhadap typo, singkatan, maupun maksud tersirat, dan jawab langsung ke inti tanpa bertele-tele.\n"
+        "- Kamu menguasai seluruh topik persampahan, limbah domestik & industri, limbah B3, kimia polimer, mikroplastik, dampak kesehatan & ekologis, pengelolaan sungai di Banten (Ciujung, Cisadane, Cibanten, Cidurian, Karangantu) maupun wilayah lain, serta riset ilmiah.\n"
+        "- Jika pengguna meminta sumber data ilmiah atau artikel/jurnal peneliti, jelaskan mekanisme ilmiahnya dan sertakan tautan Markdown [Judul/Sumber](https://...) menuju DOI atau file PDF terbuka.\n"
         "- DILARANG KERAS memberikan, menebak, atau mengarang email, kata sandi, nomor telepon, atau data akun petugas/pengguna. Jika ditanya, jawab singkat: 'Maaf, saya tidak tahu.'\n"
-        "- Jika pengguna bertanya di luar topik lingkungan/sampah/sungai/sapaan wajar, arahkan kembali secara hangat.\n"
-        f"- Data pemantauan Sungai Karangantu terkini (gunakan hanya jika relevan dengan pertanyaan): {json.dumps(snap, ensure_ascii=False)}"
+        "- Jika pengguna bertanya di luar topik lingkungan/sampah/sungai/sapaan wajar, arahkan kembali secara hangat sesuai gaya bahasa mereka.\n"
+        f"- Data pemantauan Sungai Karangantu terkini (gunakan hanya jika relevan): {json.dumps(snap, ensure_ascii=False)}"
     )
 
     contents = [
@@ -720,7 +777,7 @@ def call_gemini_llm(
         },
         {
             "role": "model",
-            "parts": [{"text": "Siap! Saya ARINA, siap berdiskusi secara cerdas, luwes, dan mendalam."}],
+            "parts": [{"text": "Siap! Saya ARINA, siap menyesuaikan gaya bahasa dan berdiskusi secara cerdas."}],
         },
     ]
 
@@ -735,8 +792,8 @@ def call_gemini_llm(
     payload = {
         "contents": contents,
         "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 1000,
+            "temperature": 0.75,
+            "maxOutputTokens": 900,
         },
     }
     encoded_body = json.dumps(payload).encode("utf-8")
@@ -746,10 +803,8 @@ def call_gemini_llm(
     if _CACHED_WORKING_MODEL:
         initial_models.append(_CACHED_WORKING_MODEL)
     initial_models.extend([
-        "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-flash-latest",
+        "gemini-2.5-flash",
         "gemini-1.5-flash",
     ])
 
@@ -763,35 +818,34 @@ def call_gemini_llm(
             if model_name in tried:
                 continue
             tried.add(model_name)
-            for ver in ("v1beta", "v1"):
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+                req = urllib.request.Request(
+                    url,
+                    data=encoded_body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=7, context=ctx) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                    cands = raw.get("candidates") or []
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts") or []
+                        text = "".join(p.get("text", "") for p in parts).strip()
+                        if text:
+                            _CACHED_WORKING_MODEL = model_name
+                            return text, model_name
+            except urllib.error.HTTPError as he:
+                err_body = ""
                 try:
-                    url = f"https://generativelanguage.googleapis.com/{ver}/models/{model_name}:generateContent?key={api_key}"
-                    req = urllib.request.Request(
-                        url,
-                        data=encoded_body,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=14, context=ctx) as resp:
-                        raw = json.loads(resp.read().decode("utf-8"))
-                        cands = raw.get("candidates") or []
-                        if cands:
-                            parts = cands[0].get("content", {}).get("parts") or []
-                            text = "".join(p.get("text", "") for p in parts).strip()
-                            if text:
-                                _CACHED_WORKING_MODEL = model_name
-                                return text, model_name
-                except urllib.error.HTTPError as he:
-                    err_body = ""
-                    try:
-                        err_body = he.read().decode("utf-8")[:140]
-                    except Exception:
-                        pass
-                    last_err = f"HTTP {he.code} ({model_name})"
-                    if he.code in (400, 403) and "API_KEY_INVALID" in err_body:
-                        return None, ""
-                except Exception as ex:
-                    last_err = type(ex).__name__
+                    err_body = he.read().decode("utf-8")[:140]
+                except Exception:
+                    pass
+                last_err = f"HTTP {he.code} ({model_name})"
+                if he.code in (400, 403) and "API_KEY_INVALID" in err_body:
+                    return None, ""
+            except Exception as ex:
+                last_err = type(ex).__name__
         return None, ""
 
     reply, ok_model = try_models(initial_models)
@@ -865,6 +919,11 @@ def ai_chat(body: AiChatIn, db: Session = Depends(get_db), _: dict = Depends(req
             "reply": "Maaf, saya tidak tahu dan tidak memiliki akses terhadap email, kata sandi, maupun data akun petugas atau pengguna. Saya hanya dapat berdiskusi seputar ilmu sampah, limbah, dampak lingkungan, dan pemantauan sungai ARINA.",
             "engine": "guardrail",
         }
+
+    # Jalur kilat (< 0.1 detik) untuk sapaan ringan agar tidak menunggu cold-start LLM
+    quick = fast_smalltalk_reply(msg, body.nickname)
+    if quick:
+        return {"reply": quick, "engine": "instant-adaptive"}
 
     snap = build_river_snapshot(db)
     api_key = get_gemini_key()
