@@ -35,8 +35,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="ARINA API - Pemantauan Sungai", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS,
-                   allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=config.STATIC_DIR), name="static")
 
 
@@ -46,12 +50,15 @@ def point_label(p: Point) -> str:
 
 
 def event_out(e: Event, p: Point) -> dict:
+    snap_url = None
+    if e.snapshot:
+        snap_url = e.snapshot if e.snapshot.startswith("data:") else f"/static/snapshots/{e.snapshot}"
     return {
         "id": e.id, "point_code": e.point_code, "point_name": p.name, "zone": p.zone,
         "lat": p.lat, "lng": p.lng, "dms": p.dms,
         "occurred_at": e.occurred_at.isoformat(), "category": e.category, "count": e.count,
         "density": e.density, "confidence": e.confidence, "status": e.status,
-        "snapshot_url": f"/static/snapshots/{e.snapshot}" if e.snapshot else None,
+        "snapshot_url": snap_url,
         "note": e.note,
     }
 
@@ -199,10 +206,9 @@ class PointReportIn(BaseModel):
 
 
 class PointReportReviewIn(BaseModel):
-    status: str  # "Valid" | "Ditolak"
+    status: str
     density: Optional[str] = None
     review_note: Optional[str] = None
-    # Data cadangan agar validasi tetap sukses meski kontainer serverless baru menyala
     location_name: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None

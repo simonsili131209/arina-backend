@@ -1,6 +1,5 @@
-"""Mesin video: webcam/CCTV + deteksi YOLOv8 otomatis, blur privasi orang, & pencatatan ke Log Kejadian."""
-import os
-import random
+"""Mesin video Hybrid Fast-Response (YOLOv8n + best.pt v2): deteksi multi-sampah, anti-wajah, & simpan bukti langsung ke DB."""
+import base64
 import random
 import threading
 import time
@@ -20,8 +19,6 @@ for _c in CATEGORIES:
     h = _c["color"].lstrip("#")
     COLORS[_c["name"]] = (int(h[4:6], 16), int(h[2:4], 16), int(h[0:2], 16))  # BGR
 
-_ALIAS = {n.lower().replace("/", " ").replace("_", " ").replace("-", " "): n for n in CATEGORY_NAMES}
-
 
 def _find_category(*keywords: str) -> str:
     for kw in keywords:
@@ -31,44 +28,58 @@ def _find_category(*keywords: str) -> str:
     return CATEGORY_NAMES[0] if CATEGORY_NAMES else "Botol plastik"
 
 
-# Pemetaan objek umum model standar (yolov8n.pt) ke kategori sampah ARINA
+# 1. Pemetaan kelas umum (yolov8n.pt) -> kategori ARINA
 _COCO_TRASH_MAP = {
     "bottle": _find_category("botol"),
-    "cup": _find_category("kemasan", "gelas", "botol"),
+    "wine glass": _find_category("botol", "gelas"),
+    "cup": _find_category("gelas", "kemasan"),
     "bowl": _find_category("kemasan", "styrofoam"),
-    "wine glass": _find_category("kaca", "botol"),
-    "vase": _find_category("kaca", "botol"),
-    "banana": _find_category("organik", "sisa"),
-    "apple": _find_category("organik", "sisa"),
-    "orange": _find_category("organik", "sisa"),
-    "sandwich": _find_category("organik", "kemasan"),
-    "donut": _find_category("organik", "kemasan"),
-    "cake": _find_category("organik", "kemasan"),
-    "book": _find_category("kertas", "kardus", "organik"),
-    "fork": _find_category("logam", "kaleng", "plastik"),
-    "knife": _find_category("logam", "kaleng"),
-    "spoon": _find_category("logam", "kaleng", "plastik"),
+    "fork": _find_category("kaleng"),
+    "knife": _find_category("kaleng"),
+    "spoon": _find_category("kaleng"),
+    "banana": _find_category("organik"),
+    "apple": _find_category("organik"),
+    "orange": _find_category("organik"),
+    "broccoli": _find_category("organik"),
+    "carrot": _find_category("organik"),
+    "sandwich": _find_category("organik"),
+    "donut": _find_category("organik"),
+    "cake": _find_category("organik"),
+    "book": _find_category("kertas", "kardus"),
 }
 
-# Pemetaan fleksibel untuk model custom (best.pt)
-_CUSTOM_KEYWORD_MAP = [
-    (("botol", "bottle"), _find_category("botol")),
-    (("kaleng", "can", "tin", "logam", "metal"), _find_category("kaleng", "logam")),
-    (("kemasan", "sachet", "bungkus", "packaging", "cup", "bowl"), _find_category("kemasan")),
-    (("kantong", "kresek", "plastic bag", "bag", "plastik"), _find_category("kantong", "plastik")),
-    (("styrofoam", "gabus", "foam"), _find_category("styrofoam", "kemasan")),
-    (("organik", "organic", "daun", "kayu", "wood", "ranting"), _find_category("organik", "kayu")),
-]
+# 2. Pemetaan 6 kelas model custom (best.pt) -> kategori ARINA
+_CUSTOM_TRASH_MAP = {
+    "biodegradable": _find_category("organik"),
+    "cardboard": _find_category("kertas", "kardus"),
+    "paper": _find_category("kertas", "kardus"),
+    "glass": _find_category("botol"),
+    "metal": _find_category("kaleng"),
+    "plastic": _find_category("kantong"),
+}
 
 
-def canonical(label: str) -> str:
-    clean = label.lower().strip().replace("/", " ").replace("_", " ").replace("-", " ")
-    if clean in _ALIAS:
-        return _ALIAS[clean]
-    for keys, target in _CUSTOM_KEYWORD_MAP:
-        if any(k in clean for k in keys):
-            return target
-    return label
+def _box_iou(a, b) -> float:
+    xA = max(a[0], b[0])
+    yA = max(a[1], b[1])
+    xB = min(a[2], b[2])
+    yB = min(a[3], b[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    if inter <= 0:
+        return 0.0
+    areaA = max(1, (a[2] - a[0]) * (a[3] - a[1]))
+    areaB = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+    return inter / float(areaA + areaB - inter)
+
+
+def _overlap_ratio(inner, outer) -> float:
+    xA = max(inner[0], outer[0])
+    yA = max(inner[1], outer[1])
+    xB = min(inner[2], outer[2])
+    yB = min(inner[3], outer[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    area_inner = max(1, (inner[2] - inner[0]) * (inner[3] - inner[1]))
+    return inter / float(area_inner)
 
 
 class VideoEngine:
@@ -82,8 +93,9 @@ class VideoEngine:
         self._detections = []
         self._updated = None
         self._cap = None
-        self._model = None
-        self._model_kind = "none"   # "custom" | "coco" | "none"
+        self._coco_model = None
+        self._custom_model = None
+        self._face_frontal = None
         self._model_name = ""
         self._tracks = []
         self._rng = random.Random()
@@ -145,30 +157,46 @@ class VideoEngine:
                 "last_logged": self._last_logged_info,
             }
 
-    # ---- sumber ----
+    # ---- sumber & pemuatan model ----
+    def _find_file(self, filename: str):
+        backend_dir = Path(__file__).resolve().parent
+        for p in [backend_dir / filename, Path(filename)]:
+            if p.exists() and p.is_file():
+                return p
+        return None
+
     def _open(self):
         self.mode, self.source = "simulasi", "sintetis"
-        self._model = None
-        self._model_kind = "none"
+        self._coco_model = None
+        self._custom_model = None
         self._model_name = ""
+
+        try:
+            f1 = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            if not f1.empty():
+                self._face_frontal = f1
+        except Exception:
+            self._face_frontal = None
 
         try:
             from ultralytics import YOLO
 
-            custom_path = Path(getattr(config, "MODEL_PATH", "best.pt"))
-            if custom_path.exists():
-                self._model = YOLO(str(custom_path))
-                self._model_kind = "custom"
-                self._model_name = custom_path.name
+            coco_path = self._find_file("yolov8n.pt")
+            custom_path = self._find_file("best.pt")
+
+            self._coco_model = YOLO(str(coco_path)) if coco_path else YOLO("yolov8n.pt")
+            if custom_path is not None:
+                self._custom_model = YOLO(str(custom_path))
+                self._model_name = "Hybrid (best.pt + yolov8n)"
             else:
-                self._model = YOLO("yolov8n.pt")
-                self._model_kind = "coco"
                 self._model_name = "yolov8n.pt"
+
             self.mode = "yolov8"
-            print(f"[ARINA] YOLOv8 aktif menggunakan model: {self._model_name}")
+            print(f"[ARINA] Deteksi AI Fast-Mode aktif: {self._model_name}")
         except Exception as e:
-            print(f"[ARINA] YOLOv8 belum tersedia ({e}); menjalankan mode simulasi.")
-            self._model = None
+            print(f"[ARINA] YOLOv8 gagal dimuat ({e}); menjalankan mode simulasi.")
+            self._coco_model = None
+            self._custom_model = None
 
         if self._stopped_by_user:
             return
@@ -176,6 +204,7 @@ class VideoEngine:
         try:
             cap = cv2.VideoCapture(getattr(config, "CAMERA_INDEX", 0))
             if cap.isOpened():
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 self._cap, self.source = cap, "kamera"
             else:
                 cap.release()
@@ -216,47 +245,142 @@ class VideoEngine:
         w = getattr(config, "FRAME_W", 640)
         h = getattr(config, "FRAME_H", 480)
         if self._cap is not None:
-            ok, frame = self._cap.read()
+            self._cap.grab()
+            ok, frame = self._cap.retrieve()
+            if not ok:
+                ok, frame = self._cap.read()
             if ok:
                 return cv2.resize(frame, (w, h)), False
         return self._synthetic(t), True
 
-    # ---- pemetaan & deteksi ----
-    def _map_label(self, raw_name: str):
-        clean = raw_name.lower().strip()
-        if clean in ("person", "human", "background", "none"):
-            return None
-        if self._model_kind == "coco":
-            return _COCO_TRASH_MAP.get(clean)
-        mapped = canonical(raw_name)
-        return mapped if mapped in CATEGORY_NAMES else None
+    # ---- pelindung wajah, kepala, & warna kulit ----
+    def _detect_faces(self, frame):
+        boxes = []
+        if self._face_frontal is None:
+            return boxes
+        small = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        detected = self._face_frontal.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=3, minSize=(22, 22))
+        for (fx, fy, fw, fh) in detected:
+            boxes.append([fx * 2, fy * 2, (fx + fw) * 2, (fy + fh) * 2])
+        return boxes
+
+    def _skin_ratio(self, frame, box) -> float:
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 12 or bh < 12:
+            return 0.0
+        ix1, iy1 = x1 + int(bw * 0.22), y1 + int(bh * 0.15)
+        ix2, iy2 = x2 - int(bw * 0.22), y2 - int(bh * 0.25)
+        crop = frame[iy1:iy2, ix1:ix2]
+        if crop.size == 0:
+            return 0.0
+        ycrcb = cv2.cvtColor(crop, cv2.COLOR_BGR2YCrCb)
+        mask = cv2.inRange(ycrcb, np.array([0, 133, 77], dtype=np.uint8), np.array([255, 173, 127], dtype=np.uint8))
+        return float(np.count_nonzero(mask)) / float(mask.size)
+
+    def _is_human_false_positive(self, frame, box, face_boxes, person_boxes) -> bool:
+        bx1, by1, bx2, by2 = box
+        cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+
+        for fbox in face_boxes:
+            if fbox[0] <= cx <= fbox[2] and fbox[1] <= cy <= fbox[3]:
+                return True
+            if _overlap_ratio(fbox, box) > 0.45:
+                return True
+
+        for pbox in person_boxes:
+            pw = max(1, pbox[2] - pbox[0])
+            ph = max(1, pbox[3] - pbox[1])
+            in_head_x = (pbox[0] + pw * 0.15) <= cx <= (pbox[2] - pw * 0.15)
+            in_head_y = pbox[1] <= cy <= (pbox[1] + ph * 0.55)
+            starts_at_head = by1 <= (pbox[1] + ph * 0.35)
+            if in_head_x and in_head_y and starts_at_head:
+                return True
+
+        if self._skin_ratio(frame, box) > 0.32:
+            return True
+
+        return False
 
     def _infer(self, frame):
-        res = self._model.predict(frame, conf=0.45, verbose=False)[0]
-        trash_dets = []
         person_boxes = []
-        for b in res.boxes:
-            raw_cls = res.names[int(b.cls[0])].lower().strip()
-            conf = float(b.conf[0])
-            x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].tolist()]
+        face_boxes = self._detect_faces(frame)
+        candidates = []
 
-            if raw_cls in ("person", "human") and conf >= 0.45:
-                person_boxes.append([x1, y1, x2, y2])
+        # Tahap A: Model Umum (yolov8n) -> manusia, botol kaku, gelas, alat makan/logam, buah/organik
+        if self._coco_model is not None:
+            res_coco = self._coco_model.predict(frame, conf=0.22, imgsz=416, verbose=False)[0]
+            for b in res_coco.boxes:
+                raw_cls = res_coco.names[int(b.cls[0])].lower().strip()
+                conf = float(b.conf[0])
+                box = [int(v) for v in b.xyxy[0].tolist()]
+
+                if raw_cls == "person" and conf >= 0.25:
+                    person_boxes.append(box)
+                    continue
+
+                if raw_cls in _COCO_TRASH_MAP:
+                    # Naikkan ambang 'bottle' ke 0.52 agar kresek lemas tidak keliru dianggap botol
+                    if raw_cls == "bottle":
+                        min_req = 0.52
+                        prio = 2 if conf >= 0.62 else 1
+                    elif raw_cls in ("spoon", "fork", "knife"):
+                        min_req = 0.24
+                        prio = 2
+                    else:
+                        min_req = 0.36
+                        prio = 2
+
+                    if conf >= min_req:
+                        candidates.append({
+                            "label": _COCO_TRASH_MAP[raw_cls],
+                            "confidence": round(conf * 100, 1),
+                            "box": box,
+                            "priority": prio,
+                        })
+
+        # Tahap B: Model Custom (best.pt) -> kantong plastik (kresek), kardus/kertas, organik, kaleng
+        if self._custom_model is not None:
+            res_cust = self._custom_model.predict(frame, conf=0.38, imgsz=416, verbose=False)[0]
+            for b in res_cust.boxes:
+                raw_cls = res_cust.names[int(b.cls[0])].lower().strip()
+                conf = float(b.conf[0])
+                box = [int(v) for v in b.xyxy[0].tolist()]
+
+                mapped = _CUSTOM_TRASH_MAP.get(raw_cls)
+                if not mapped:
+                    continue
+
+                min_cust = 0.58 if raw_cls == "biodegradable" else 0.38
+                prio = 2 if (raw_cls == "plastic" and conf >= 0.44) else 1
+                if conf >= min_cust:
+                    candidates.append({
+                        "label": mapped,
+                        "confidence": round(conf * 100, 1),
+                        "box": box,
+                        "priority": prio,
+                    })
+
+        # Tahap C: Saring wajah/kepala/kulit & gabungkan kotak bertumpuk
+        filtered = [
+            c for c in candidates
+            if not self._is_human_false_positive(frame, c["box"], face_boxes, person_boxes)
+        ]
+        filtered.sort(key=lambda x: (x["priority"], x["confidence"]), reverse=True)
+
+        final_dets = []
+        for item in filtered:
+            if any(_box_iou(item["box"], kept["box"]) > 0.45 for kept in final_dets):
                 continue
-
-            if conf < 0.50:
-                continue
-
-            label = self._map_label(raw_cls)
-            if not label:
-                continue
-
-            trash_dets.append({
-                "label": label,
-                "confidence": round(conf * 100, 1),
-                "box": [x1, y1, x2, y2],
+            final_dets.append({
+                "label": item["label"],
+                "confidence": item["confidence"],
+                "box": item["box"],
             })
-        return trash_dets, person_boxes
+
+        return final_dets, person_boxes
 
     def _simulate(self, shape):
         h, w = shape[:2]
@@ -311,7 +435,7 @@ class VideoEngine:
         suffix = " | ORANG DI-BLUR" if privacy_badge else ""
         tag = f"{header} | {datetime.now():%d/%m/%Y %H:%M:%S}{suffix}"
         cv2.rectangle(out, (0, 0), (out.shape[1], 28), (22, 32, 38), -1)
-        cv2.putText(out, tag, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (235, 245, 255), 1, cv2.LINE_AA)
+        cv2.putText(out, tag, (10, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (235, 245, 255), 1, cv2.LINE_AA)
         return out
 
     def _build_blurred_snapshot(self, raw_frame, dets, person_boxes):
@@ -328,7 +452,6 @@ class VideoEngine:
                     roi = snap[y1:y2, x1:x2]
                     snap[y1:y2, x1:x2] = cv2.GaussianBlur(roi, (99, 99), 30)
 
-            # Kembalikan area objek sampah agar tidak ikut kabur saat dipegang
             for d in dets:
                 bx1, by1, bx2, by2 = d["box"]
                 pad = 8
@@ -339,7 +462,19 @@ class VideoEngine:
 
         return self._draw(snap, dets, synthetic=False, privacy_badge=has_person), has_person
 
-    # ---- simpan otomatis ke Log Kejadian (Menunggu Verifikasi) & Statistik ----
+    def _encode_snapshot_for_db(self, snapshot_frame) -> str | None:
+        """Kompres foto bukti (~18 KB) dan ubah ke Base64 agar tersimpan langsung di database tanpa memenuhi folder laptop."""
+        try:
+            thumb = cv2.resize(snapshot_frame, (480, 360), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 62])
+            if not ok:
+                return None
+            b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            return f"data:image/jpeg;base64,{b64}"
+        except Exception:
+            return None
+
+    # ---- simpan otomatis ke Log Kejadian (langsung ke DB) ----
     def _record_if_stable(self, raw_frame, dets, person_boxes):
         if self.mode != "yolov8":
             return
@@ -375,14 +510,7 @@ class VideoEngine:
                 if not pt:
                     return
 
-                snap_name = None
-                try:
-                    snap_dir = Path(config.STATIC_DIR) / "snapshots"
-                    snap_dir.mkdir(parents=True, exist_ok=True)
-                    snap_name = f"yolo_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
-                    cv2.imwrite(str(snap_dir / snap_name), snapshot_frame)
-                except Exception:
-                    snap_name = None
+                snap_data_uri = self._encode_snapshot_for_db(snapshot_frame)
 
                 note_text = (
                     f"Deteksi otomatis YOLOv8 ({self._model_name}) · Sosok pemegang sampah disamarkan (blur)"
@@ -397,11 +525,23 @@ class VideoEngine:
                     count=1,
                     density=pt.density,
                     confidence=round(confidence, 1),
-                    status=STATUS_FLOW[0],  # Masuk sebagai data Menunggu Verifikasi
-                    snapshot=snap_name,
+                    status=STATUS_FLOW[0],
+                    snapshot=snap_data_uri,
                     note=note_text,
                 )
                 db.add(ev)
+                db.flush()
+
+                # Batasi penyimpanan foto maksimal pada 80 log terbaru agar ukuran arina.db tetap ringan (< 2 MB)
+                old_events = (
+                    db.query(Event)
+                    .filter(Event.snapshot.isnot(None))
+                    .order_by(Event.id.desc())
+                    .offset(80)
+                    .all()
+                )
+                for old_ev in old_events:
+                    old_ev.snapshot = None
 
                 stat = (
                     db.query(PointCategoryStat)
@@ -428,7 +568,7 @@ class VideoEngine:
                         "point": pt.code,
                         "at": datetime.now().strftime("%H:%M:%S"),
                     }
-                print(f"[ARINA] Tercatat ke Log (Menunggu Verifikasi): {category} ({confidence:.1f}%) | blur_orang={has_person}")
+                print(f"[ARINA] Tersimpan langsung ke DB: {category} ({confidence:.1f}%) | blur_orang={has_person}")
         except Exception as e:
             print(f"[ARINA] Gagal menyimpan deteksi ke database: {e}")
 
@@ -437,7 +577,7 @@ class VideoEngine:
         self._open()
         interval = 1.0 / getattr(config, "TARGET_FPS", 15)
         idle_timeout = getattr(config, "IDLE_TIMEOUT", 60)
-        jpeg_quality = getattr(config, "JPEG_QUALITY", 80)
+        jpeg_quality = getattr(config, "JPEG_QUALITY", 75)
         try:
             while self._running and not self._stopped_by_user and time.time() - self._last_touch < idle_timeout:
                 t0 = time.time()
@@ -445,7 +585,7 @@ class VideoEngine:
                 if self._stopped_by_user:
                     break
 
-                if self.mode == "yolov8" and self._model and not synthetic:
+                if self.mode == "yolov8" and (self._coco_model or self._custom_model) and not synthetic:
                     dets, person_boxes = self._infer(raw_frame)
                 else:
                     dets, person_boxes = self._simulate(raw_frame.shape)
@@ -465,9 +605,7 @@ class VideoEngine:
 
     def mjpeg(self):
         last = None
-        start = time.time()
-        max_sec = 8.0 if os.getenv("VERCEL") else float("inf")
-        while not self._stopped_by_user and (time.time() - start < max_sec):
+        while not self._stopped_by_user:
             self.touch()
             with self._lock:
                 jpeg = self._jpeg
