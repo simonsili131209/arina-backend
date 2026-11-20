@@ -615,21 +615,26 @@ SENSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-GREETING_TOKENS = {
+# Kata-kata sapaan (boleh memanggil nama)
+GREETING_ONLY_TOKENS = {
     "hai", "halo", "hallo", "hello", "hi", "hey", "hei", "helo", "p", "ping",
-    "tes", "test", "pagi", "siang", "sore", "malam", "selamat",
+    "pagi", "siang", "sore", "malam", "selamat",
     "assalamualaikum", "assalamu'alaikum", "salam",
-    "yo", "yoo", "yow", "oy", "oi", "woy", "cuy", "bro", "sis", "bestie", "min",
+    "yo", "yoo", "yow", "oy", "oi", "woy", "woi", "cuy", "bro", "sis", "bestie", "min",
     "arina", "juga", "dong", "nih", "ya", "kak", "bang", "mas", "mba", "mbak",
-    "apa", "kabar", "kabarmu", "kabarnya", "gimana", "gmn", "baik", "sehat",
+}
+
+# Basa-basi non-sapaan (tanpa menyebut nama agar mengalir natural)
+CASUAL_CHAT_TOKENS = GREETING_ONLY_TOKENS | {
+    "tes", "test", "apa", "kabar", "kabarmu", "kabarnya", "gimana", "gmn", "baik", "sehat",
     "wkwk", "wkwkwk", "hehe", "haha", "mantap", "oke", "ok", "siap",
-    "makasih", "terima", "kasih", "thanks", "thx",
+    "makasih", "terima", "kasih", "thanks", "thx", "gk", "ga", "gak", "jadi",
 }
 
 GAUL_HINTS = {
-    "yo", "yoo", "yow", "oy", "oi", "woy", "cuy", "bro", "bestie", "wkwk",
+    "yo", "yoo", "yow", "oy", "oi", "woy", "woi", "cuy", "bro", "bestie", "wkwk",
     "wkwkwk", "gmn", "gimana", "nih", "dong", "gw", "gue", "lu", "lo",
-    "anjir", "gokil", "spill", "relate", "parah", "bgt", "banget", "sih",
+    "gokil", "spill", "relate", "parah", "bgt", "banget", "sih", "gk", "ga", "gak",
 }
 
 _CACHED_WORKING_MODEL: Optional[str] = None
@@ -640,34 +645,46 @@ def fast_smalltalk_reply(msg: str, nickname: Optional[str]) -> Optional[str]:
     words = [w for w in cleaned.split() if w]
     if not words or len(words) > 5:
         return None
-    if not all(w in GREETING_TOKENS for w in words):
+    if not all(w in CASUAL_CHAT_TOKENS for w in words):
         return None
 
     nick = (nickname or "").strip()
-    call = f" {nick}" if nick else ""
-    is_gaul = any(w in GAUL_HINTS for w in words) or cleaned in ("hai juga", "halo juga", "p", "tes", "test")
+    is_gaul = any(w in GAUL_HINTS for w in words) or cleaned in ("hai juga", "halo juga", "hallo juga", "p", "tes", "test")
 
+    # 1. Ucapan terima kasih (tanpa nama)
     if any(w in ("makasih", "terima", "kasih", "thanks", "thx") for w in words):
         if is_gaul:
             return secrets.choice([
-                f"Sama-sama{call}! Kalau ada yang mau diobrolin lagi soal sungai atau sampah, gas langsung tanya aja ya.",
-                f"Siap, santai aja{call}! Kabarin kapan aja kalau butuh info atau data titik sungai.",
+                "Sama-sama! Kalau ada yang mau diobrolin lagi soal sungai atau sampah, gas langsung tanya aja ya.",
+                "Siap, santai aja! Kabarin kapan aja kalau butuh info atau data titik sungai.",
             ])
-        return f"Sama-sama{call}! Senang bisa membantu. Silakan tanyakan apa saja seputar pemantauan sungai dan pengelolaan sampah."
+        return "Sama-sama! Senang bisa membantu. Silakan tanyakan apa saja seputar pemantauan sungai dan pengelolaan sampah."
 
+    # 2. Tanya kabar (tanpa nama)
     if any(w in ("kabar", "kabarmu", "kabarnya", "gimana", "gmn") for w in words):
         if is_gaul:
             return secrets.choice([
-                f"Aman terkendali{call}! Sistem pantau sungai lagi on fire nih. Lu sendiri gimana, ada yang mau di-spill atau ditanyain?",
-                f"Kabar baik banget{call}! Lagi standby mantau kondisi sungai nih. Mau bahas apa kita hari ini?",
+                "Aman terkendali! Sistem pantau sungai lagi on fire nih. Gimana, ada yang mau di-spill atau ditanyain?",
+                "Kabar baik banget! Lagi standby mantau kondisi sungai nih. Mau bahas apa kita hari ini?",
             ])
-        return f"Kabar baik{call}! Sistem pemantauan ARINA siap menemani diskusi. Ada topik sampah atau kondisi sungai yang ingin dibahas?"
+        return "Kabar baik! Sistem pemantauan ARINA siap menemani diskusi. Ada topik sampah atau kondisi sungai yang ingin dibahas?"
 
+    # 3. Reaksi singkat seperti "gk jadi wkwk" / "oke siap" (tanpa nama)
+    if any(w in ("jadi", "wkwk", "wkwkwk", "hehe", "haha", "oke", "ok", "siap", "mantap") for w in words):
+        if is_gaul:
+            return secrets.choice([
+                "Wkwk siap, santai aja! Kalau tiba-tiba kepikiran mau bahas soal sampah atau sungai, langsung panggil aja ya.",
+                "Oke sip! Standby terus di sini kok kalau sewaktu-waktu butuh data atau mau diskusi.",
+            ])
+        return "Baik, siap! Silakan sampaikan kapan saja jika ada pertanyaan atau topik lingkungan yang ingin dibahas."
+
+    # 4. Sapaan murni (hai, oi, hallo, woi, yo, pagi, assalamualaikum) -> BOLEH pakai nama panggilan
+    call = f" {nick}" if nick else ""
     if is_gaul:
         return secrets.choice([
             f"Hai juga{call}! Gimana nih, mau ngobrolin kondisi Sungai Karangantu, dampak sampah plastik, atau lagi nyari referensi riset?",
-            f"Yo hai{call}! Santai aja di sini, mau bahas soal sampah, limbah, atau kondisi sungai mana nih?",
-            f"Hai{call}! Siap nemenin diskusi nih—mau nanya hal serius soal lingkungan atau ngobrol santai soal sampah sungai, gas aja!",
+            f"Oi{call}! Santai aja di sini, mau bahas soal sampah, limbah, atau kondisi sungai mana nih?",
+            f"Hallo{call}! Siap nemenin diskusi nih—mau nanya hal serius soal lingkungan atau ngobrol santai soal sampah sungai, gas aja!",
         ])
 
     return secrets.choice([
@@ -750,17 +767,18 @@ def call_gemini_llm(
     global _CACHED_WORKING_MODEL
 
     call_name = (nickname or "").strip()
-    user_ref = (
-        f"Nama panggilan pengguna adalah '{call_name}'. Sebut namanya sesekali secara alami dan akrab."
-        if call_name else ""
+    name_rule = (
+        f"- ATURAN PENYEBUTAN NAMA: Nama pengguna adalah '{call_name}', tetapi JANGAN PERNAH menyebut nama atau gelar tersebut saat menjawab pertanyaan, berdiskusi, atau menanggapi obrolan lanjutan karena terasa kaku dan formal. Penyebutan nama HANYA boleh dipakai jika pengguna mengirim sapaan pembuka seperti 'hai', 'oi', 'hallo', atau 'woi'."
+        if call_name else
+        "- ATURAN PENYEBUTAN NAMA: Jangan menyebut nama atau gelar pengguna di dalam percakapan."
     )
 
     persona_prompt = (
         "Kamu adalah ARINA, asisten AI berwawasan luas, cerdas, luwes, dan adaptif pada platform pemantauan Sungai Karangantu.\n"
-        f"{user_ref}\n"
+        f"{name_rule}\n"
         "KEMAMPUAN ADAPTASI GAYA BAHASA (BUNGLON KOMUNIKASI):\n"
         "- Amati gaya ketikan pengguna pada pesan terakhir dan riwayat chat!\n"
-        "- Jika pengguna memakai bahasa gaul / santai / kekinian (seperti 'gw/lu', 'cuy', 'bro', 'bestie', 'spill', 'gokil', 'parah banget', 'relate', 'wkwk', 'btw', singkatan santai), sesuaikan gaya bicaramu agar ikut santai, akrab, ekspresif, dan kekinian seperti teman ngobrol sepantaran yang asyik—namun penjelasan ilmiah dan datanya tetap tajam dan akurat.\n"
+        "- Jika pengguna memakai bahasa gaul / santai / kekinian (seperti 'gw/lu', 'cuy', 'bro', 'bestie', 'spill', 'gokil', 'parah banget', 'relate', 'wkwk', 'btw', singkatan santai), sesuaikan gaya bicaramu agar ikut santai, akrab, ekspresif, dan kekinian seperti teman ngobrol sepantaran yang asyik (tetap sopan tanpa kata kasar)—dan pastikan penjelasan ilmiah serta datanya tetap tajam dan akurat.\n"
         "- Jika pengguna memakai bahasa Indonesia yang sopan, semi-formal, atau akademis (misalnya menanyakan jurnal penelitian atau analisis teknis), gunakan bahasa yang rapi, jelas, dan profesional.\n"
         "- Tanggap terhadap typo, singkatan, maupun maksud tersirat, dan jawab langsung ke inti tanpa bertele-tele.\n"
         "- Kamu menguasai seluruh topik persampahan, limbah domestik & industri, limbah B3, kimia polimer, mikroplastik, dampak kesehatan & ekologis, pengelolaan sungai di Banten (Ciujung, Cisadane, Cibanten, Cidurian, Karangantu) maupun wilayah lain, serta riset ilmiah.\n"
@@ -777,7 +795,7 @@ def call_gemini_llm(
         },
         {
             "role": "model",
-            "parts": [{"text": "Siap! Saya ARINA, siap menyesuaikan gaya bahasa dan berdiskusi secara cerdas."}],
+            "parts": [{"text": "Siap! Saya ARINA, siap berdiskusi secara luwes tanpa menyebut nama pengguna di luar sapaan awal."}],
         },
     ]
 
@@ -792,7 +810,7 @@ def call_gemini_llm(
     payload = {
         "contents": contents,
         "generationConfig": {
-            "temperature": 0.75,
+            "temperature": 0.72,
             "maxOutputTokens": 900,
         },
     }
@@ -920,7 +938,6 @@ def ai_chat(body: AiChatIn, db: Session = Depends(get_db), _: dict = Depends(req
             "engine": "guardrail",
         }
 
-    # Jalur kilat (< 0.1 detik) untuk sapaan ringan agar tidak menunggu cold-start LLM
     quick = fast_smalltalk_reply(msg, body.nickname)
     if quick:
         return {"reply": quick, "engine": "instant-adaptive"}
