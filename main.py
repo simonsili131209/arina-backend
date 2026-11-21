@@ -438,7 +438,11 @@ def points(db: Session = Depends(get_db), _: dict = Depends(require_user)):
     }
 
 
-# ----------------------------------------------------------------- penitikan koordinat masyarakat & validasi petugas
+# ----------------------------------------------------------------- penitikan koordinat masyarakat, validasi & rotasi foto DB
+PHOTO_MAX_AGE_DAYS = 7
+PHOTO_STORAGE_LIMIT_BYTES = 40 * 1024 * 1024  # 40 MB ambang aman foto di database
+
+
 class PointReportIn(BaseModel):
     location_name: str
     lat: float
@@ -462,8 +466,91 @@ class PointReportReviewIn(BaseModel):
     photo_data: Optional[str] = None
 
 
+class CleanupPhotosIn(BaseModel):
+    mode: str = "older_than_7d"  # "older_than_7d" | "all_reviewed"
+
+
+def cleanup_old_report_photos(
+    db: Session,
+    max_age_days: int = PHOTO_MAX_AGE_DAYS,
+    max_total_bytes: int = PHOTO_STORAGE_LIMIT_BYTES,
+    force_reviewed: bool = False,
+) -> dict:
+    """Hapus foto laporan > 7 hari (minggu lalu) atau saat database foto mulai penuh.
+    Titik koordinat & riwayat laporan tetap tersimpan di database."""
+    cutoff = datetime.now() - timedelta(days=max_age_days)
+    rows = (
+        db.query(PointReport)
+        .filter(PointReport.photo_data.isnot(None))
+        .order_by(PointReport.created_at.asc())
+        .all()
+    )
+
+    deleted_count = 0
+    freed_bytes = 0
+
+    for r in rows:
+        if not r.photo_data:
+            continue
+        is_expired = r.created_at is not None and r.created_at < cutoff
+        is_reviewed_purge = force_reviewed and r.status in ("Valid", "Ditolak")
+        if is_expired or is_reviewed_purge:
+            freed_bytes += len(r.photo_data)
+            r.photo_data = None
+            deleted_count += 1
+
+    remaining = [r for r in rows if r.photo_data]
+    total_bytes = sum(len(r.photo_data) for r in remaining)
+
+    # Jika total foto di database masih melewati ambang batas, hapus dari yang paling lama
+    if total_bytes > max_total_bytes:
+        remaining.sort(key=lambda r: (0 if r.status != "Menunggu Peninjauan" else 1, r.created_at or datetime.min))
+        for r in remaining:
+            if total_bytes <= max_total_bytes:
+                break
+            if r.photo_data:
+                sz = len(r.photo_data)
+                r.photo_data = None
+                total_bytes -= sz
+                freed_bytes += sz
+                deleted_count += 1
+
+    if deleted_count > 0:
+        db.commit()
+
+    active_photos = [r for r in rows if r.photo_data]
+    active_bytes = sum(len(r.photo_data) for r in active_photos)
+    return {
+        "deleted_count": deleted_count,
+        "freed_bytes": freed_bytes,
+        "photo_count": len(active_photos),
+        "used_bytes": active_bytes,
+        "limit_bytes": max_total_bytes,
+        "retention_days": max_age_days,
+    }
+
+
+def compute_photo_storage_stats(db: Session) -> dict:
+    cutoff = datetime.now() - timedelta(days=PHOTO_MAX_AGE_DAYS)
+    rows = db.query(PointReport).filter(PointReport.photo_data.isnot(None)).all()
+    used_bytes = sum(len(r.photo_data) for r in rows if r.photo_data)
+    expired_count = sum(1 for r in rows if r.photo_data and r.created_at and r.created_at < cutoff)
+    reviewed_with_photo = sum(1 for r in rows if r.photo_data and r.status in ("Valid", "Ditolak"))
+    return {
+        "photo_count": len(rows),
+        "used_bytes": used_bytes,
+        "used_mb": round(used_bytes / (1024 * 1024), 2),
+        "limit_mb": round(PHOTO_STORAGE_LIMIT_BYTES / (1024 * 1024), 1),
+        "usage_pct": min(100, round((used_bytes / PHOTO_STORAGE_LIMIT_BYTES) * 100, 1)) if PHOTO_STORAGE_LIMIT_BYTES else 0,
+        "expired_count": expired_count,
+        "reviewed_with_photo": reviewed_with_photo,
+        "retention_days": PHOTO_MAX_AGE_DAYS,
+    }
+
+
 @app.get("/api/point-reports")
 def list_point_reports(db: Session = Depends(get_db), user: dict = Depends(require_user)):
+    cleanup_old_report_photos(db)
     rows = db.query(PointReport).order_by(PointReport.created_at.desc()).all()
     if user.get("role") == "admin":
         visible = rows
@@ -471,6 +558,28 @@ def list_point_reports(db: Session = Depends(get_db), user: dict = Depends(requi
         uid = str(user.get("sub"))
         visible = [r for r in rows if r.status == "Valid" or r.reporter_id == uid]
     return {"reports": [report_out(r) for r in visible]}
+
+
+@app.get("/api/point-reports/storage")
+def point_report_storage(db: Session = Depends(get_db), _: dict = Depends(require_admin)):
+    cleanup_old_report_photos(db)
+    return compute_photo_storage_stats(db)
+
+
+@app.post("/api/point-reports/cleanup-photos")
+def manual_cleanup_photos(
+    body: CleanupPhotosIn,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    force_reviewed = body.mode == "all_reviewed"
+    res = cleanup_old_report_photos(db, force_reviewed=force_reviewed)
+    stats = compute_photo_storage_stats(db)
+    return {
+        "deleted_count": res["deleted_count"],
+        "freed_mb": round(res["freed_bytes"] / (1024 * 1024), 2),
+        **stats,
+    }
 
 
 @app.post("/api/point-reports")
@@ -498,6 +607,10 @@ def create_point_report(body: PointReportIn, db: Session = Depends(get_db), user
     )
     db.add(rep)
     db.commit()
+    db.refresh(rep)
+
+    # Jalankan pembersihan otomatis foto > 7 hari atau jika kapasitas database mulai penuh
+    cleanup_old_report_photos(db)
     db.refresh(rep)
     return report_out(rep)
 
@@ -615,7 +728,6 @@ SENSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Kata-kata sapaan (boleh memanggil nama)
 GREETING_ONLY_TOKENS = {
     "hai", "halo", "hallo", "hello", "hi", "hey", "hei", "helo", "p", "ping",
     "pagi", "siang", "sore", "malam", "selamat",
@@ -624,7 +736,6 @@ GREETING_ONLY_TOKENS = {
     "arina", "juga", "dong", "nih", "ya", "kak", "bang", "mas", "mba", "mbak",
 }
 
-# Basa-basi non-sapaan (tanpa menyebut nama agar mengalir natural)
 CASUAL_CHAT_TOKENS = GREETING_ONLY_TOKENS | {
     "tes", "test", "apa", "kabar", "kabarmu", "kabarnya", "gimana", "gmn", "baik", "sehat",
     "wkwk", "wkwkwk", "hehe", "haha", "mantap", "oke", "ok", "siap",
@@ -651,7 +762,6 @@ def fast_smalltalk_reply(msg: str, nickname: Optional[str]) -> Optional[str]:
     nick = (nickname or "").strip()
     is_gaul = any(w in GAUL_HINTS for w in words) or cleaned in ("hai juga", "halo juga", "hallo juga", "p", "tes", "test")
 
-    # 1. Ucapan terima kasih (tanpa nama)
     if any(w in ("makasih", "terima", "kasih", "thanks", "thx") for w in words):
         if is_gaul:
             return secrets.choice([
@@ -660,7 +770,6 @@ def fast_smalltalk_reply(msg: str, nickname: Optional[str]) -> Optional[str]:
             ])
         return "Sama-sama! Senang bisa membantu. Silakan tanyakan apa saja seputar pemantauan sungai dan pengelolaan sampah."
 
-    # 2. Tanya kabar (tanpa nama)
     if any(w in ("kabar", "kabarmu", "kabarnya", "gimana", "gmn") for w in words):
         if is_gaul:
             return secrets.choice([
@@ -669,7 +778,6 @@ def fast_smalltalk_reply(msg: str, nickname: Optional[str]) -> Optional[str]:
             ])
         return "Kabar baik! Sistem pemantauan ARINA siap menemani diskusi. Ada topik sampah atau kondisi sungai yang ingin dibahas?"
 
-    # 3. Reaksi singkat seperti "gk jadi wkwk" / "oke siap" (tanpa nama)
     if any(w in ("jadi", "wkwk", "wkwkwk", "hehe", "haha", "oke", "ok", "siap", "mantap") for w in words):
         if is_gaul:
             return secrets.choice([
@@ -678,7 +786,6 @@ def fast_smalltalk_reply(msg: str, nickname: Optional[str]) -> Optional[str]:
             ])
         return "Baik, siap! Silakan sampaikan kapan saja jika ada pertanyaan atau topik lingkungan yang ingin dibahas."
 
-    # 4. Sapaan murni (hai, oi, hallo, woi, yo, pagi, assalamualaikum) -> BOLEH pakai nama panggilan
     call = f" {nick}" if nick else ""
     if is_gaul:
         return secrets.choice([
